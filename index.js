@@ -1,4 +1,4 @@
-// index.js — v3.9 + Telegram notify + Mint clean text + Axiom link separate
+// index.js — v3.9 + Telegram notify + Axiom /t/{mint}
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
@@ -155,7 +155,7 @@ function startLiveWatch(mint, name = "", symbol = "") {
           `🎥 <b>LIVE START</b> | ${title}`,
           ``,
           `Mint: <code>${mint}</code>`,
-          `🔗 <b>Axiom:</b> https://axiom.trade/meme/${mint}`,
+          `🔗 <b>Axiom:</b> https://axiom.trade/t/${mint}`,
           `💰 Market Cap: ${mcapStr}`,
           ``,
           socials.join("\n")
