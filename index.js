@@ -1,10 +1,15 @@
-// index.js — v3.9: LIVE-only + только официальные поля соцсетей
+// index.js — v3.9 + Telegram notify
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
 const WS_URL = "wss://pumpportal.fun/api/data";
 const API = "https://frontend-api-v3.pump.fun";
 
+// === Telegram config ===
+const TG_TOKEN = "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc"; // замени позже
+const TG_CHAT_ID = "-4857972467"; // замени позже
+
+// === params ===
 const CHECK_INTERVAL = 5000;       // каждые 5с проверка
 const MAX_LIFETIME_MS = 30000;     // живём максимум 15с
 const MIN_GAP_MS = 800;            // лимит запросов ~1.2 rps
@@ -86,6 +91,29 @@ function extractOfficialSocials(coin) {
   return socials;
 }
 
+// ——— Telegram
+function escapeHtml(s = "") {
+  return s.replace(/[&<>]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[ch]));
+}
+
+async function sendTG(text) {
+  if (!TG_TOKEN || !TG_CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TG_CHAT_ID,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true
+      })
+    });
+  } catch (e) {
+    log("⚠️  telegram send error:", e.message);
+  }
+}
+
 // ——— watcher (15s lifetime)
 function startLiveWatch(mint, name = "", symbol = "") {
   if (tracking.has(mint)) return;
@@ -116,6 +144,16 @@ function startLiveWatch(mint, name = "", symbol = "") {
         if (typeof coin.usd_market_cap === "number")
           log(`   mcap_usd: ${coin.usd_market_cap.toFixed(2)}`);
         log(`   socials: ${socials.join("  ")}`);
+
+        // --- отправка в Telegram ---
+        const title = `${coin.name || name} (${coin.symbol || symbol})`;
+        const msg = [
+          `<b>🎥 LIVE START</b> | ${escapeHtml(title)}`,
+          `mint: <code>${escapeHtml(mint)}</code>`,
+          typeof coin.usd_market_cap === "number" ? `mcap_usd: ${coin.usd_market_cap.toFixed(2)}` : null,
+          socials.length ? `socials: ${socials.map(escapeHtml).join("  ")}` : null
+        ].filter(Boolean).join("\n");
+        await sendTG(msg);
       }
     } catch (e) {
       metrics.httpOther++;
@@ -176,4 +214,3 @@ setInterval(() => {
 // ——— start
 log("Worker starting…");
 connect();
-  
