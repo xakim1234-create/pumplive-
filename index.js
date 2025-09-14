@@ -1,15 +1,15 @@
-// index.js — v3.5: LIVE-only + socials filter
+// index.js — v3.6: LIVE-only + socials, быстрый режим (15с окно)
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
 const WS_URL = "wss://pumpportal.fun/api/data";
 const API = "https://frontend-api-v3.pump.fun";
 
-const LIVE_INTERVAL = 25000;
-const LIVE_TIMEOUT_MIN = 30;
-const MIN_GAP_MS = 1000;
-const MAX_RETRIES = 4;
-const MAX_WATCHERS = 200;
+const CHECK_INTERVAL = 5000;       // каждые 5с проверка
+const MAX_LIFETIME_MS = 15000;     // живём максимум 15с
+const MIN_GAP_MS = 800;            // лимит запросов ~1.2 rps
+const MAX_RETRIES = 2;
+const MAX_WATCHERS = 500;
 
 const tracking = new Map();
 const seen = new Set();
@@ -33,32 +33,25 @@ async function throttle() {
   nextAvailableAt = Date.now() + MIN_GAP_MS;
 }
 
-// ——— fetch with retries
+// ——— fetch JSON
 async function safeGetJson(url) {
   metrics.requests++;
-  let lastErr;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       await throttle();
-      const cacheBust = url.includes("?") ? `&t=${Date.now()}` : `?t=${Date.now()}`;
-      const r = await fetch(url + cacheBust, {
+      const r = await fetch(url, {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/3.5"
+          "user-agent": "pumplive-watcher/3.6"
         }
       });
       if (r.status === 429) {
         metrics.http429++;
-        const ra = r.headers.get("retry-after");
-        const waitMs = ra ? Number(ra) * 1000 : 4000 + Math.random() * 2000;
+        const waitMs = 2000 + Math.random() * 2000;
         nextAvailableAt = Date.now() + waitMs;
-        if (attempt < MAX_RETRIES) {
-          metrics.retries++;
-          await new Promise(res => setTimeout(res, waitMs));
-          continue;
-        }
-        throw new Error("HTTP 429");
+        await new Promise(res => setTimeout(res, waitMs));
+        continue;
       }
       if (!r.ok) {
         metrics.httpOther++;
@@ -69,34 +62,25 @@ async function safeGetJson(url) {
         metrics.emptyBody++;
         throw new Error("Empty body");
       }
-      const data = JSON.parse(text);
       metrics.ok++;
-      return data;
+      return JSON.parse(text);
     } catch (e) {
-      lastErr = e;
       if (attempt < MAX_RETRIES) {
         metrics.retries++;
-        const base = 800 * (attempt + 1);
-        const jitter = Math.floor(Math.random() * 400);
-        await new Promise(res => setTimeout(res, base + jitter));
+        await new Promise(res => setTimeout(res, 400 * (attempt + 1)));
         continue;
       }
       metrics.skippedNull++;
       return null;
     }
   }
-  return null;
 }
 
-// ——— social detection
+// ——— socials
 function extractSocials(obj) {
   const socials = [];
-
-  const directFields = ["twitter", "telegram", "website", "discord"];
-  for (const f of directFields) {
-    if (obj?.[f]) socials.push(`${f}=${obj[f]}`);
-  }
-
+  const direct = ["twitter", "telegram", "website", "discord"];
+  for (const f of direct) if (obj?.[f]) socials.push(`${f}=${obj[f]}`);
   const desc = obj?.description || "";
   const regexes = [
     /(https?:\/\/t\.me\/[^\s]+)/gi,
@@ -110,37 +94,31 @@ function extractSocials(obj) {
   ];
   for (const re of regexes) {
     let m;
-    while ((m = re.exec(desc)) !== null) {
-      socials.push(`link=${m[1]}`);
-    }
+    while ((m = re.exec(desc)) !== null) socials.push(`link=${m[1]}`);
   }
-
   return socials;
 }
 
 async function extractSocialsDeep(coin) {
   let socials = extractSocials(coin);
-
   if ((!socials || socials.length === 0) && coin?.metadata_uri) {
     try {
       const meta = await safeGetJson(coin.metadata_uri);
       socials = extractSocials(meta || {});
-    } catch { /* ignore */ }
+    } catch {}
   }
   return socials;
 }
 
-// ——— watcher
+// ——— watcher (15s lifetime)
 function startLiveWatch(mint, name = "", symbol = "") {
   if (tracking.has(mint)) return;
   if (tracking.size >= MAX_WATCHERS) return;
 
   const startedAt = Date.now();
-  const jitter = Math.floor(Math.random() * 5000);
-
   const timer = setInterval(async () => {
     try {
-      if ((Date.now() - startedAt) / 60000 > LIVE_TIMEOUT_MIN) {
+      if (Date.now() - startedAt > MAX_LIFETIME_MS) {
         clearInterval(timer);
         tracking.delete(mint);
         return;
@@ -154,21 +132,20 @@ function startLiveWatch(mint, name = "", symbol = "") {
         tracking.delete(mint);
 
         const socials = await extractSocialsDeep(coin);
-        if (socials.length === 0) return; // no socials → skip
+        if (socials.length === 0) return;
 
         lastLiveAt = Date.now();
         log(`🎥 LIVE START | ${coin.name || name} (${coin.symbol || symbol})`);
         log(`   mint: ${mint}`);
-        if (typeof coin.usd_market_cap === "number") {
+        if (typeof coin.usd_market_cap === "number")
           log(`   mcap_usd: ${coin.usd_market_cap.toFixed(2)}`);
-        }
         log(`   socials: ${socials.join("  ")}`);
       }
     } catch (e) {
       metrics.httpOther++;
       log("⚠️  live-check error:", e.message);
     }
-  }, LIVE_INTERVAL + jitter);
+  }, CHECK_INTERVAL);
 
   tracking.set(mint, timer);
 }
@@ -194,15 +171,13 @@ function connect() {
     }
   });
 
-  ws.on("close", (c, r) => {
+  ws.on("close", () => {
     metrics.reconnects++;
-    log(`🔌 WS closed ${c} ${(r || "").toString()}. Reconnecting in 5s…`);
+    log(`🔌 WS closed → Reconnecting in 5s…`);
     setTimeout(connect, 5000);
   });
 
-  ws.on("error", (e) => {
-    log("❌ WS error:", e.message);
-  });
+  ws.on("error", (e) => log("❌ WS error:", e.message));
 }
 
 // ——— heartbeat
@@ -210,14 +185,12 @@ setInterval(() => {
   const now = Date.now();
   const secSinceWs = lastWsMsgAt ? Math.round((now - lastWsMsgAt) / 1000) : -1;
   const minSinceLive = lastLiveAt ? Math.round((now - lastLiveAt) / 60000) : -1;
-
   console.log(
     `[stats] watchers=${tracking.size}  ws_last=${secSinceWs}s  live_last=${minSinceLive}m  ` +
-    `req=${metrics.requests} ok=${metrics.ok} retries=${metrics.retries} 429=${metrics.http429} ` +
-    `other=${metrics.httpOther} empty=${metrics.emptyBody} null=${metrics.skippedNull} ` +
-    `reconnects=${metrics.reconnects}`
+    `req=${metrics.requests} ok=${metrics.ok} retries=${metrics.retries} ` +
+    `429=${metrics.http429} other=${metrics.httpOther} empty=${metrics.emptyBody} ` +
+    `null=${metrics.skippedNull} reconnects=${metrics.reconnects}`
   );
-
   if (secSinceWs >= 0 && secSinceWs > 300) {
     console.log(`[guard] no WS messages for ${secSinceWs}s → force reconnect`);
     try { ws?.terminate(); } catch {}
