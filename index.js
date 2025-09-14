@@ -1,4 +1,4 @@
-// index.js — v3.9: LIVE-only + только официальные поля соцсетей
+// index.js — v4.1: LIVE-only + токеновые метрики
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
@@ -6,7 +6,7 @@ const WS_URL = "wss://pumpportal.fun/api/data";
 const API = "https://frontend-api-v3.pump.fun";
 
 const CHECK_INTERVAL = 5000;       // каждые 5с проверка
-const MAX_LIFETIME_MS = 30000;     // живём максимум 15с
+const MAX_LIFETIME_MS = 30000;     // живём максимум 30с
 const MIN_GAP_MS = 800;            // лимит запросов ~1.2 rps
 const MAX_RETRIES = 2;
 const MAX_WATCHERS = 500;
@@ -22,6 +22,12 @@ const metrics = {
   http429: 0, httpOther: 0,
   emptyBody: 0, skippedNull: 0,
   reconnects: 0,
+
+  tokens_tracked: 0,
+  tokens_completed: 0,
+  tokens_live: 0,
+  tokens_dropped: 0,
+  tokens_missed: 0,
 };
 
 // ——— helpers
@@ -43,7 +49,7 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/3.9"
+          "user-agent": "pumplive-watcher/4.1"
         }
       });
       if (r.status === 429) {
@@ -86,17 +92,32 @@ function extractOfficialSocials(coin) {
   return socials;
 }
 
-// ——— watcher (15s lifetime)
+// ——— watcher (30s lifetime)
 function startLiveWatch(mint, name = "", symbol = "") {
   if (tracking.has(mint)) return;
   if (tracking.size >= MAX_WATCHERS) return;
 
+  metrics.tokens_tracked++;
   const startedAt = Date.now();
+
   const timer = setInterval(async () => {
     try {
       if (Date.now() - startedAt > MAX_LIFETIME_MS) {
         clearInterval(timer);
         tracking.delete(mint);
+        metrics.tokens_dropped++;
+        metrics.tokens_completed++;
+
+        // бэкап-чек через 1 мин
+        setTimeout(async () => {
+          try {
+            const coin = await safeGetJson(`${API}/coins/${mint}`);
+            if (coin && coin.is_currently_live) {
+              metrics.tokens_missed++;
+            }
+          } catch {}
+        }, 60_000);
+
         return;
       }
 
@@ -106,6 +127,8 @@ function startLiveWatch(mint, name = "", symbol = "") {
       if (coin.is_currently_live) {
         clearInterval(timer);
         tracking.delete(mint);
+        metrics.tokens_live++;
+        metrics.tokens_completed++;
 
         const socials = extractOfficialSocials(coin);
         if (socials.length === 0) return; // все 4 null → пропускаем
@@ -166,6 +189,10 @@ setInterval(() => {
     `req=${metrics.requests} ok=${metrics.ok} retries=${metrics.retries} ` +
     `429=${metrics.http429} other=${metrics.httpOther} empty=${metrics.emptyBody} ` +
     `null=${metrics.skippedNull} reconnects=${metrics.reconnects}`
+  );
+  console.log(
+    `        tokens_tracked=${metrics.tokens_tracked} completed=${metrics.tokens_completed} ` +
+    `live=${metrics.tokens_live} dropped=${metrics.tokens_dropped} missed=${metrics.tokens_missed}`
   );
   if (secSinceWs >= 0 && secSinceWs > 300) {
     console.log(`[guard] no WS messages for ${secSinceWs}s → force reconnect`);
