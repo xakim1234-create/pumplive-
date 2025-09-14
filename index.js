@@ -1,4 +1,4 @@
-// index.js — v3.6: LIVE-only + socials, быстрый режим (15с окно)
+// index.js — v3.7: LIVE-only + socials (включая Twitch), быстрый режим (15с окно)
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
@@ -43,7 +43,7 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/3.6"
+          "user-agent": "pumplive-watcher/3.7"
         }
       });
       if (r.status === 429) {
@@ -90,6 +90,7 @@ function extractSocials(obj) {
     /(https?:\/\/(www\.)?youtube\.com\/[^\s]+)/gi,
     /(https?:\/\/youtu\.be\/[^\s]+)/gi,
     /(https?:\/\/(www\.)?tiktok\.com\/[^\s]+)/gi,
+    /(https?:\/\/(www\.)?twitch\.tv\/[^\s]+)/gi,   // <— Twitch
     /(https?:\/\/[^\s]+)/gi,
   ];
   for (const re of regexes) {
