@@ -6,7 +6,7 @@ const WS_URL = "wss://pumpportal.fun/api/data";
 const API = "https://frontend-api-v3.pump.fun";
 
 const CHECK_INTERVAL = 5000;       // каждые 5с проверка
-const MAX_LIFETIME_MS = 15000;     // живём максимум 15с
+const MAX_LIFETIME_MS = 30000;     // живём максимум 15с
 const MIN_GAP_MS = 800;            // лимит запросов ~1.2 rps
 const MAX_RETRIES = 2;
 const MAX_WATCHERS = 500;
