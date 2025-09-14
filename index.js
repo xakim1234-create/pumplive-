@@ -1,4 +1,4 @@
-// index.js — v3.9 + Telegram notify (safe send)
+// index.js — v3.9 + Telegram notify + pretty template
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
@@ -36,6 +36,10 @@ async function throttle() {
   const now = Date.now();
   if (now < nextAvailableAt) await new Promise(r => setTimeout(r, nextAvailableAt - now));
   nextAvailableAt = Date.now() + MIN_GAP_MS;
+}
+
+function formatNumber(n) {
+  return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 // ——— fetch JSON
@@ -84,18 +88,14 @@ async function safeGetJson(url) {
 // ——— socials check (только официальные поля)
 function extractOfficialSocials(coin) {
   const socials = [];
-  if (coin?.telegram) socials.push(`telegram=${coin.telegram}`);
-  if (coin?.twitter) socials.push(`twitter=${coin.twitter}`);
-  if (coin?.discord) socials.push(`discord=${coin.discord}`);
-  if (coin?.website) socials.push(`website=${coin.website}`);
+  if (coin?.website) socials.push(`🌐 <b>Website:</b> ${coin.website}`);
+  if (coin?.twitter) socials.push(`🐦 <b>Twitter:</b> ${coin.twitter}`);
+  if (coin?.telegram) socials.push(`💬 <b>Telegram:</b> ${coin.telegram}`);
+  if (coin?.discord) socials.push(`🎮 <b>Discord:</b> ${coin.discord}`);
   return socials;
 }
 
 // ——— Telegram
-function escapeHtml(s = "") {
-  return s.replace(/[&<>]/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[ch]));
-}
-
 async function sendTG(text) {
   if (!TG_TOKEN || !TG_CHAT_ID) return;
   try {
@@ -106,7 +106,7 @@ async function sendTG(text) {
         chat_id: TG_CHAT_ID,
         text,
         parse_mode: "HTML",
-        disable_web_page_preview: true
+        disable_web_page_preview: false
       })
     });
   } catch (e) {
@@ -145,14 +145,20 @@ function startLiveWatch(mint, name = "", symbol = "") {
           log(`   mcap_usd: ${coin.usd_market_cap.toFixed(2)}`);
         log(`   socials: ${socials.join("  ")}`);
 
-        // --- отправка в Telegram ---
+        // --- форматируем сообщение для Telegram ---
         const title = `${coin.name || name} (${coin.symbol || symbol})`;
+        const mcapStr = typeof coin.usd_market_cap === "number"
+          ? `$${formatNumber(coin.usd_market_cap)}`
+          : "n/a";
+
         const msg = [
-          `<b>🎥 LIVE START</b> | ${escapeHtml(title)}`,
-          `mint: <code>${escapeHtml(mint)}</code>`,
-          typeof coin.usd_market_cap === "number" ? `mcap_usd: ${coin.usd_market_cap.toFixed(2)}` : null,
-          socials.length ? `socials: ${socials.map(escapeHtml).join("  ")}` : null
-        ].filter(Boolean).join("\n");
+          `🎥 <b>LIVE START</b> | ${title}`,
+          ``,
+          `Mint: <a href="https://axiom.trade/meme/${mint}">${mint}</a>`,
+          `💰 Market Cap: ${mcapStr}`,
+          ``,
+          socials.join("\n")
+        ].join("\n");
 
         log("📤 sending to Telegram…");
         sendTG(msg).then(() => {
