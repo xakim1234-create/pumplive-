@@ -1,14 +1,10 @@
 {
-  "name": "pumplive-watcher",
-  "version": "4.2.0",
+  "name": "pump-watcher",
+  "version": "1.0.0",
   "type": "module",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
   "dependencies": {
     "ws": "^8.18.0",
-    "node-fetch": "^3.3.2",
-    "dotenv": "^16.4.5"
+    "node-fetch": "^3.3.2"
   }
 }
