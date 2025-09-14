@@ -1,4 +1,4 @@
-// index.js — v3.7: LIVE-only + socials (включая Twitch), быстрый режим (15с окно)
+// index.js — v3.9: LIVE-only + только официальные поля соцсетей
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
@@ -43,7 +43,7 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/3.7"
+          "user-agent": "pumplive-watcher/3.9"
         }
       });
       if (r.status === 429) {
@@ -76,38 +76,13 @@ async function safeGetJson(url) {
   }
 }
 
-// ——— socials
-function extractSocials(obj) {
+// ——— socials check (только официальные поля)
+function extractOfficialSocials(coin) {
   const socials = [];
-  const direct = ["twitter", "telegram", "website", "discord"];
-  for (const f of direct) if (obj?.[f]) socials.push(`${f}=${obj[f]}`);
-  const desc = obj?.description || "";
-  const regexes = [
-    /(https?:\/\/t\.me\/[^\s]+)/gi,
-    /(https?:\/\/(x|twitter)\.com\/[^\s]+)/gi,
-    /(https?:\/\/discord\.(gg|com)\/[^\s]+)/gi,
-    /(https?:\/\/(www\.)?instagram\.com\/[^\s]+)/gi,
-    /(https?:\/\/(www\.)?youtube\.com\/[^\s]+)/gi,
-    /(https?:\/\/youtu\.be\/[^\s]+)/gi,
-    /(https?:\/\/(www\.)?tiktok\.com\/[^\s]+)/gi,
-    /(https?:\/\/(www\.)?twitch\.tv\/[^\s]+)/gi,   // <— Twitch
-    /(https?:\/\/[^\s]+)/gi,
-  ];
-  for (const re of regexes) {
-    let m;
-    while ((m = re.exec(desc)) !== null) socials.push(`link=${m[1]}`);
-  }
-  return socials;
-}
-
-async function extractSocialsDeep(coin) {
-  let socials = extractSocials(coin);
-  if ((!socials || socials.length === 0) && coin?.metadata_uri) {
-    try {
-      const meta = await safeGetJson(coin.metadata_uri);
-      socials = extractSocials(meta || {});
-    } catch {}
-  }
+  if (coin?.telegram) socials.push(`telegram=${coin.telegram}`);
+  if (coin?.twitter) socials.push(`twitter=${coin.twitter}`);
+  if (coin?.discord) socials.push(`discord=${coin.discord}`);
+  if (coin?.website) socials.push(`website=${coin.website}`);
   return socials;
 }
 
@@ -132,8 +107,8 @@ function startLiveWatch(mint, name = "", symbol = "") {
         clearInterval(timer);
         tracking.delete(mint);
 
-        const socials = await extractSocialsDeep(coin);
-        if (socials.length === 0) return;
+        const socials = extractOfficialSocials(coin);
+        if (socials.length === 0) return; // все 4 null → пропускаем
 
         lastLiveAt = Date.now();
         log(`🎥 LIVE START | ${coin.name || name} (${coin.symbol || symbol})`);
