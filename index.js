@@ -1,6 +1,5 @@
 // index.js — v4.2: (основано на v4.1) LIVE-only + офиц. соцсети + токеновые метрики + Telegram notify
 import WebSocket from 'ws';
-import fetch from 'node-fetch';
 
 const WS_URL = 'wss://pumpportal.fun/api/data';
 const API    = 'https://frontend-api-v3.pump.fun';
