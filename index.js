@@ -1,4 +1,4 @@
-// index.js — v3.9 + Telegram notify
+// index.js — v3.9 + Telegram notify (safe send)
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
@@ -153,7 +153,13 @@ function startLiveWatch(mint, name = "", symbol = "") {
           typeof coin.usd_market_cap === "number" ? `mcap_usd: ${coin.usd_market_cap.toFixed(2)}` : null,
           socials.length ? `socials: ${socials.map(escapeHtml).join("  ")}` : null
         ].filter(Boolean).join("\n");
-        await sendTG(msg);
+
+        log("📤 sending to Telegram…");
+        sendTG(msg).then(() => {
+          log("✅ sent to Telegram");
+        }).catch(e => {
+          log("⚠️ TG error:", e.message);
+        });
       }
     } catch (e) {
       metrics.httpOther++;
