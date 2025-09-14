@@ -1,4 +1,4 @@
-// index.js — v3.9 + Telegram notify + Mint as Axiom link
+// index.js — v3.9 + Telegram notify + Mint clean text + Axiom link separate
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
@@ -85,7 +85,7 @@ async function safeGetJson(url) {
   }
 }
 
-// ——— socials check (только официальные поля)
+// ——— socials check
 function extractOfficialSocials(coin) {
   const socials = [];
   if (coin?.website) socials.push(`🌐 <b>Website:</b> ${coin.website}`);
@@ -114,7 +114,7 @@ async function sendTG(text) {
   }
 }
 
-// ——— watcher (15s lifetime)
+// ——— watcher
 function startLiveWatch(mint, name = "", symbol = "") {
   if (tracking.has(mint)) return;
   if (tracking.size >= MAX_WATCHERS) return;
@@ -154,7 +154,8 @@ function startLiveWatch(mint, name = "", symbol = "") {
         const msg = [
           `🎥 <b>LIVE START</b> | ${title}`,
           ``,
-          `Mint: <a href="https://axiom.trade/meme/${mint}">${mint}</a>`,
+          `Mint: <code>${mint}</code>`,
+          `🔗 <b>Axiom:</b> https://axiom.trade/meme/${mint}`,
           `💰 Market Cap: ${mcapStr}`,
           ``,
           socials.join("\n")
