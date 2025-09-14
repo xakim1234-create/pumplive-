@@ -1,5 +1,4 @@
 // index.js — v4.2: (основано на v4.1) LIVE-only + офиц. соцсети + токеновые метрики + Telegram notify
-import 'dotenv/config';
 import WebSocket from 'ws';
 import fetch from 'node-fetch';
 
