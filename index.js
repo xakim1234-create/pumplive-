@@ -1,4 +1,4 @@
-// index.js — v3.9 + Telegram notify + pretty template
+// index.js — v3.9 + Telegram notify + Mint as Axiom link
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
@@ -10,9 +10,9 @@ const TG_TOKEN = "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc"; // замен
 const TG_CHAT_ID = "-4857972467"; // замени позже
 
 // === params ===
-const CHECK_INTERVAL = 5000;       // каждые 5с проверка
-const MAX_LIFETIME_MS = 30000;     // живём максимум 15с
-const MIN_GAP_MS = 800;            // лимит запросов ~1.2 rps
+const CHECK_INTERVAL = 5000;
+const MAX_LIFETIME_MS = 30000;
+const MIN_GAP_MS = 800;
 const MAX_RETRIES = 2;
 const MAX_WATCHERS = 500;
 
@@ -136,7 +136,7 @@ function startLiveWatch(mint, name = "", symbol = "") {
         tracking.delete(mint);
 
         const socials = extractOfficialSocials(coin);
-        if (socials.length === 0) return; // все 4 null → пропускаем
+        if (socials.length === 0) return;
 
         lastLiveAt = Date.now();
         log(`🎥 LIVE START | ${coin.name || name} (${coin.symbol || symbol})`);
