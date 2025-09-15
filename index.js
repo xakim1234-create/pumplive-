@@ -1,6 +1,6 @@
 // index.js
 import WebSocket from "ws";
-import fetch from "node-fetch";
+// fetch встроен в Node.js v18+ — импорт не нужен
 
 // ============================
 // Конфиг
