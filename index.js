@@ -1,4 +1,4 @@
-// index.js — v6.0 (API queue + Viewers queue) + Telegram photo + Axiom /t/{mint}
+// index.js — v6.0.1 (API queue + Viewers queue) + Telegram photo + Axiom /t/{mint}
 import WebSocket from "ws";
 import fetch from "node-fetch";
 import puppeteer from "puppeteer";
@@ -62,7 +62,7 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/6.0"
+          "user-agent": "pumplive-watcher/6.0.1"
         }
       });
 
@@ -165,7 +165,6 @@ function enqueue(mint, name = "", symbol = "") {
 }
 
 function requeue(item) {
-  // лёгкий ре-чек через 4с — используем STEP из viewers как референс
   item.nextTryAt = Date.now() + 4000;
   queue.push(item);
 }
@@ -208,12 +207,12 @@ async function apiWorkerLoop() {
         continue;
       }
 
-      // Готово к viewers-проверке
+      // готово к viewers-проверке
       inQueue.delete(mint);
       enqueueViewers({ mint, coin, fallbackName: name, fallbackSymbol: symbol });
       lastLiveAt = Date.now();
 
-      // Лог как раньше
+      // лог как раньше
       log(`🎥 LIVE START | ${coin.name || name} (${coin.symbol || symbol})`);
       log(`   mint: ${mint}`);
       if (typeof coin.usd_market_cap === "number")
@@ -223,7 +222,7 @@ async function apiWorkerLoop() {
       continue;
     }
 
-    // Ещё не LIVE — вернём в очередь до истечения времени
+    // ещё не LIVE — вернём в очередь до истечения времени
     requeue(item);
   }
 }
@@ -248,15 +247,21 @@ function enqueueViewers({ mint, coin, fallbackName = "", fallbackSymbol = "" }) 
 
 async function getBrowser() {
   if (browser) return browser;
+
+  // ЯВНО берём путь к Chrome, установленному postinstall’ом
+  const execPath = await puppeteer.executablePath();
+
   browser = await puppeteer.launch({
+    executablePath: execPath,
     args: ["--no-sandbox", "--disable-setuid-sandbox"],
     headless: true
   });
+
+  log("✅ Puppeteer ready:", execPath);
   return browser;
 }
 
 async function checkViewersOnce(page) {
-  // пытаемся найти #live-indicator и рядом <span> с числом
   const liveHandle = await page.$("#live-indicator");
   if (!liveHandle) return { ok: false, viewers: null, reason: "no_live_indicator" };
   const viewersHandle = await page.evaluateHandle(
@@ -276,7 +281,10 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
   try {
     const br = await getBrowser();
     page = await br.newPage();
-    await page.goto(`https://pump.fun/coin/${mint}`, { waitUntil: "domcontentloaded", timeout: VIEWERS_PAGE_TIMEOUT });
+    await page.goto(`https://pump.fun/coin/${mint}`, {
+      waitUntil: "domcontentloaded",
+      timeout: VIEWERS_PAGE_TIMEOUT
+    });
 
     let maxV = -1;
     let sent = false;
@@ -290,7 +298,6 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
       } else {
         if (res.viewers > maxV) maxV = res.viewers;
         if (res.viewers >= VIEWERS_THRESHOLD) {
-          // Успех — отправляем и выходим
           await notifyTelegram(mint, coin, fallbackName, fallbackSymbol, res.viewers);
           sent = true;
           break;
@@ -306,10 +313,7 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
       sent = true;
     }
 
-    if (!sent) {
-      // дропаем тихо
-    }
-
+    // если не отправили — просто дропаем
     metrics.viewerTasksDone++;
   } catch (e) {
     metrics.viewerOpenErrors++;
