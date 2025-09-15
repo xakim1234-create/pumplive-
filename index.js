@@ -38,8 +38,8 @@ const API_NULL_STEP_MS = int("API_NULL_STEP_MS", 1000);       // шаг 1s ме�
 const HEARTBEAT_MS = int("HEARTBEAT_MS", 60_000);
 
 // Telegram — либо ENV, либо хардкод ниже
-const TG_TOKEN_HARDCODED = "";  // <--- вставь сюда свой бот-токен, если не хочешь ENV
-const TG_CHAT_ID_HARDCODED = ""; // <--- вставь сюда свой chat_id (можно отрицательный для групп)
+const TG_TOKEN_HARDCODED = "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc";  // <--- вставь сюда свой бот-токен, если не хочешь ENV
+const TG_CHAT_ID_HARDCODED = "-4857972467"; // <--- вставь сюда свой chat_id (можно отрицательный для групп)
 const TG_TOKEN = (process.env.TG_TOKEN || TG_TOKEN_HARDCODED || "").trim();
 const TG_CHAT_ID = (process.env.TG_CHAT_ID || TG_CHAT_ID_HARDCODED || "").trim();
 
