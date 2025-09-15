@@ -1,7 +1,5 @@
-// index.js — v7.8.1 (fixed)
+// index.js — v7.8.4 (full, robust, no logic removed)
 // Robust LIVE-indicator capture: all frames, late render, reload-if-live, richer diagnostics
-// - Indicator wait 40s, Task timeout 90s, protocolTimeout 60s
-// - Interception enabled AFTER indicator found
 
 import os from "os";
 import process from "process";
@@ -26,10 +24,10 @@ const MAX_RETRIES = 2;
 
 // ——— “Зрители”
 const VIEWERS_THRESHOLD = 30;
-const INDICATOR_WAIT_MS = 40_000; // ждём индикатор до 40с (было 25)
+const INDICATOR_WAIT_MS = 40_000; // ждём индикатор до 40с
 const SAMPLE_COUNT = 3; // 3 замера
 const SAMPLE_STEP_MS = 3000; // каждые ~3с
-const VIEWERS_TASK_TIMEOUT = 90_000; // общий таймаут одной задачи в браузере (было 60)
+const VIEWERS_TASK_TIMEOUT = 90_000; // общий таймаут одной задачи в браузере
 
 // ——— Браузер
 const VIEWERS_CONCURRENCY = 1; // держим 1 вкладку одновременно
@@ -104,7 +102,7 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/7.8.1",
+          "user-agent": "pumplive-watcher/7.8.4",
         },
       });
 
@@ -265,7 +263,6 @@ async function updateChromeRSS() {
     }
     const proc = browser.process?.();
     if (!proc) return;
-    // Best-effort: на некоторых платформах не достать RSS дочернего процесса
   } catch {}
 }
 
@@ -353,9 +350,9 @@ async function waitIndicatorOrExplain(page, timeoutMs, taskId) {
           metrics.ind_found_selector++;
           metrics.ind_wait_samples_ms.push(dt);
           log(
-            `[ind] t#${taskId} found via=selector_any_frame dt=${dt}ms iframe=${inIframe} framePath="${framePath(
-              f
-            )}" frameUrl="${url}"`
+            `[ind] t#${taskId} found via=selector_any_frame dt=${dt}ms iframe=${inIframe} framePath=${JSON.stringify(
+              framePath(f)
+            )} frameUrl=${JSON.stringify(url)}`
           );
           return { ok: true, reason: "selector_any_frame", frame: f, dt };
         }
@@ -376,7 +373,9 @@ async function waitIndicatorOrExplain(page, timeoutMs, taskId) {
         metrics.ind_found_text++;
         metrics.ind_wait_samples_ms.push(dt);
         log(
-          `[ind] t#${taskId} found via=text_fallback dt=${dt}ms framePath="${framePath(f)}" url="${f.url()}"`
+          `[ind] t#${taskId} found via=text_fallback dt=${dt}ms framePath=${JSON.stringify(
+            framePath(f)
+          )} url=${JSON.stringify(f.url())}`
         );
         return { ok: true, reason: "text_fallback_frames", frame: f, dt };
       }
@@ -398,7 +397,11 @@ async function waitIndicatorOrExplain(page, timeoutMs, taskId) {
   const dt = Date.now() - start;
   metrics.ind_timeout++;
   metrics.ind_wait_samples_ms.push(dt);
-  log(`[ind] t#${taskId} MISS dt=${dt}ms ready=${ready} counts=${counts.map((c) => `${c.sel}:${c.n}`).join("|")}`);
+  log(
+    `[ind] t#${taskId} MISS dt=${dt}ms ready=${ready} counts=${counts
+      .map((c) => `${c.sel}:${c.n}`)
+      .join("|")}`
+  );
   return { ok: false, reason: "timeout_or_missing", frame: null, dt };
 }
 
@@ -565,7 +568,9 @@ async function viewersWorkerLoop() {
     const detectAt = job.enqueuedAt;
     const task = viewersTask({ ...job, detectAt });
 
-    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("viewer task timeout")), VIEWERS_TASK_TIMEOUT));
+    const timeout = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error("viewer task timeout")), VIEWERS_TASK_TIMEOUT)
+    );
     try {
       await Promise.race([task, timeout]);
     } catch (e) {
@@ -582,35 +587,19 @@ async function apiWorkerLoop() {
   while (true) {
     let idx = -1;
     const now = Date.now();
-    for (let i = 0; i < queue.length; i++) if (queue[i].nextTryAt <= now) {
-        idx = i;
-        break;
-      }
-    if (idx === -1) {
-      await new Promise((r) => setTimeout(r, 200));
-      continue;
-    }
+    for (let i = 0; i < queue.length; i++) if (queue[i].nextTryAt <= now) { idx = i; break; }
+    if (idx === -1) { await new Promise((r) => setTimeout(r, 200)); continue; }
 
     const item = queue.splice(idx, 1)[0];
     const { mint, name, symbol, expiresAt } = item;
-    if (Date.now() > expiresAt) {
-      inQueue.delete(mint);
-      continue;
-    }
+    if (Date.now() > expiresAt) { inQueue.delete(mint); continue; }
 
     const coin = await safeGetJson(`${API}/coins/${mint}`);
-    if (!coin) {
-      item.nextTryAt = Date.now() + 4000;
-      queue.push(item);
-      continue;
-    }
+    if (!coin) { item.nextTryAt = Date.now() + 4000; queue.push(item); continue; }
 
     if (coin.is_currently_live) {
       const socials = extractOfficialSocials(coin);
-      if (socials.length === 0) {
-        inQueue.delete(mint);
-        continue; // фильтр: без соцсетей не тратим браузер
-      }
+      if (socials.length === 0) { inQueue.delete(mint); continue; }
 
       inQueue.delete(mint);
       enqueueViewers({ mint, coin, fallbackName: name, fallbackSymbol: symbol });
@@ -623,7 +612,6 @@ async function apiWorkerLoop() {
       continue;
     }
 
-    // пока не live — ещё попробуем позже
     item.nextTryAt = Date.now() + 4000;
     queue.push(item);
   }
@@ -640,12 +628,7 @@ function connect() {
 
   ws.on("message", (raw) => {
     lastWsMsgAt = Date.now();
-    let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     const mint = msg?.mint || msg?.tokenMint || msg?.ca || null;
     if (!mint) return;
     const nm = msg?.name || msg?.tokenName || "";
@@ -677,28 +660,21 @@ setInterval(() => {
   );
   if (secSinceWs >= 0 && secSinceWs > 300) {
     console.log(`[guard] no WS messages for ${secSinceWs}s → force reconnect`);
-    try {
-      ws?.terminate();
-    } catch {}
+    try { ws?.terminate(); } catch {}
   }
 }, 60_000);
 
 // ресурсы раз в 15с
-setInterval(async () => {
-  await updateChromeRSS();
-  await logResources();
-}, RES_LOG_EVERY_MS);
+setInterval(async () => { await updateChromeRSS(); await logResources(); }, RES_LOG_EVERY_MS);
 
 // индикаторная сводка каждые 5 минут
 setInterval(() => {
   const a = metrics.ind_wait_samples_ms;
-  const p50 = pct(a, 50),
-    p90 = pct(a, 90),
-    p99 = pct(a, 99);
+  const p50 = pct(a, 50), p90 = pct(a, 90), p99 = pct(a, 99);
   console.log(
     `[ind-sum] samples=${a.length} p50=${p50}ms p90=${p90}ms p99=${p99}ms ` +
-      `found_sel=${metrics.ind_found_selector} found_text=${metrics.ind_found_text} ` +
-      `found_after_reload=${metrics.ind_found_after_reload} timeouts=${metrics.ind_timeout} iframe_hits=${metrics.ind_iframe_hits}`
+    `found_sel=${metrics.ind_found_selector} found_text=${metrics.ind_found_text} ` +
+    `found_after_reload=${metrics.ind_found_after_reload} timeouts=${metrics.ind_timeout} iframe_hits=${metrics.ind_iframe_hits}`
   );
 }, 300_000);
 
@@ -708,15 +684,5 @@ connect();
 apiWorkerLoop();
 viewersWorkerLoop();
 
-process.on("SIGTERM", async () => {
-  try {
-    await browser?.close();
-  } catch {}
-  process.exit(0);
-});
-process.on("SIGINT", async () => {
-  try {
-    await browser?.close();
-  } catch {}
-  process.exit(0);
-});
+process.on("SIGTERM", async () => { try { await browser?.close(); } catch {} process.exit(0); });
+process.on("SIGINT",  async () => { try { await browser?.close(); } catch {} process.exit(0); });
