@@ -1,4 +1,4 @@
-// index.js — v7.2.0 (new page per token, close after use)
+// index.js — v7.3.0 (wait 60s indicator, 2 samples, log active_pages)
 import WebSocket from "ws";
 import fetch from "node-fetch";
 import chromium from "@sparticuz/chromium";
@@ -20,7 +20,6 @@ const MAX_RETRIES = 2;
 // === Зрители ===
 const VIEWERS_THRESHOLD = 30;
 const SAMPLE_STEP_MS = 5_000;
-const SAMPLE_ITER = 6;
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 
@@ -60,7 +59,7 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/7.2.0"
+          "user-agent": "pumplive-watcher/7.3.0"
         }
       });
 
@@ -211,7 +210,7 @@ async function getBrowser() {
 }
 
 // ——— поиск числа зрителей
-async function findViewersNumber(pg) {
+async function checkViewersOnce(pg) {
   return await pg.evaluate(() => {
     const pickNumber = (txt) => {
       const m = (txt || "").match(/\d{1,6}/);
@@ -232,22 +231,8 @@ async function findViewersNumber(pg) {
       if (Number.isFinite(n)) return { ok: true, viewers: n };
     }
 
-    const blocks = Array.from(document.querySelectorAll('div,section,header'));
-    for (const el of blocks) {
-      const t = (el.textContent || '').trim();
-      if (/live/i.test(t)) {
-        const n = pickNumber(t);
-        if (Number.isFinite(n)) return { ok: true, viewers: n };
-      }
-    }
     return { ok: false, reason: 'no_live_indicator' };
   });
-}
-
-async function checkViewersOnce(pg) {
-  const res = await findViewersNumber(pg);
-  if (!res.ok) return { ok: false, viewers: null, reason: res.reason || 'unknown' };
-  return { ok: true, viewers: res.viewers };
 }
 
 async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
@@ -271,44 +256,47 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
     await sleep(1500);
     log(`🌐 goto:done dt_nav=${tNav()}ms wait_dom_extra=1500ms`);
 
-    // ждём индикатор не дольше 30с
+    // ждём индикатор до 60с
     const tSel = makeTimer();
     try {
-      await pg.waitForSelector("#live-indicator", { timeout: 30_000 });
+      await pg.waitForSelector("#live-indicator", { timeout: 60_000 });
       log(`🔎 live-indicator:found=true dt=${tSel()}ms`);
     } catch {
       metrics.viewerSelectorMiss++;
       log(`🔎 live-indicator:found=false dt=${tSel()}ms reason=timeout_or_missing`);
+      await pg.close();
+      log(`🗑 page:closed active_pages=${(await browser.pages()).length}`);
+      metrics.viewerTasksDone++;
+      return;
     }
 
+    // два замера (10 секунд)
     let maxV = -1;
-    for (let i = 0; i < SAMPLE_ITER; i++) {
+    for (let i = 0; i < 2; i++) {
       const tSample = makeTimer();
       const res = await checkViewersOnce(pg);
       if (!res.ok) {
-        log(`📊 sample i=${i + 1}/${SAMPLE_ITER} ok=false reason=${res.reason} dt=${tSample()}ms`);
+        log(`📊 sample i=${i + 1}/2 ok=false reason=${res.reason} dt=${tSample()}ms`);
       } else {
         maxV = Math.max(maxV, res.viewers);
-        log(`📊 sample i=${i + 1}/${SAMPLE_ITER} ok=true viewers=${res.viewers} dt=${tSample()}ms`);
-        if (res.viewers >= VIEWERS_THRESHOLD) {
-          await notifyTelegram(mint, coin, fallbackName, fallbackSymbol, res.viewers, jobTimer());
-          metrics.viewerTasksDone++;
-          await pg.close();
-          log("🗑 page:closed");
-          return;
-        }
+        log(`📊 sample i=${i + 1}/2 ok=true viewers=${res.viewers} dt=${tSample()}ms`);
       }
-      if (i < SAMPLE_ITER - 1) await sleep(SAMPLE_STEP_MS);
+      if (i < 1) await sleep(SAMPLE_STEP_MS);
     }
 
-    log(`⏭️ threshold:miss max=${maxV < 0 ? "n/a" : maxV} t_window=30s t_total=${jobTimer()}ms`);
+    if (maxV >= VIEWERS_THRESHOLD) {
+      await notifyTelegram(mint, coin, fallbackName, fallbackSymbol, maxV, jobTimer());
+    } else {
+      log(`⏭️ threshold:miss max=${maxV} t_total=${jobTimer()}ms`);
+    }
+
     metrics.viewerTasksDone++;
     await pg.close();
-    log("🗑 page:closed");
+    log(`🗑 page:closed active_pages=${(await browser.pages()).length}`);
   } catch (e) {
     metrics.viewerOpenErrors++;
     log(`⚠️ viewers task error: ${e.message}`);
-    try { await pg?.close(); log("🗑 page:closed after error"); } catch {}
+    try { await pg?.close(); log(`🗑 page:closed after error active_pages=${(await browser.pages()).length}`); } catch {}
   }
 }
 
@@ -388,10 +376,11 @@ function connect() {
 }
 
 // ===================== Heartbeat =====================
-setInterval(() => {
+setInterval(async () => {
   const now = nowMs();
   const secSinceWs = lastWsMsgAt ? Math.round((now - lastWsMsgAt) / 1000) : -1;
   const minSinceLive = lastLiveAt ? Math.round((now - lastLiveAt) / 60000) : -1;
+  const br = browser ? await browser.pages() : [];
   console.log(
     `[stats] watchers=${queueSize()}  ws_last=${secSinceWs}s  live_last=${minSinceLive}m  ` +
     `req=${metrics.requests} ok=${metrics.ok} retries=${metrics.retries} ` +
@@ -399,7 +388,7 @@ setInterval(() => {
     `null=${metrics.skippedNull} reconnects=${metrics.reconnects}  ` +
     `vQ=${viewersQueue.length} vRun=${viewersActive} ` +
     `vStart=${metrics.viewerTasksStarted} vDone=${metrics.viewerTasksDone} vDrop=${metrics.viewerTasksDropped} ` +
-    `vOpenErr=${metrics.viewerOpenErrors} vSelMiss=${metrics.viewerSelectorMiss}`
+    `vOpenErr=${metrics.viewerOpenErrors} vSelMiss=${metrics.viewerSelectorMiss} active_pages=${br.length}`
   );
   if (secSinceWs >= 0 && secSinceWs > 300) {
     console.log(`[guard] no WS messages for ${secSinceWs}s → force reconnect`);
