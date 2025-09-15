@@ -1,7 +1,8 @@
-// index.js — v6.0.1 (API queue + Viewers queue) + Telegram photo + Axiom /t/{mint}
+// index.js — v6.1.0 (API queue + Viewers queue, chromium serverless)
 import WebSocket from "ws";
 import fetch from "node-fetch";
-import puppeteer from "puppeteer";
+import chromium from "@sparticuz/chromium";   // ⬅️ новый импорт
+import puppeteer from "puppeteer-core";       // ⬅️ новый импорт
 
 const WS_URL = "wss://pumpportal.fun/api/data";
 const API = "https://frontend-api-v3.pump.fun";
@@ -11,27 +12,26 @@ const TG_TOKEN = "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc";
 const TG_CHAT_ID = "-4857972467";
 
 // === Тюнинг API-очереди ===
-const MIN_GAP_MS = 1500;            // глобальный лимитер RPS для REST
-const MAX_LIFETIME_MS = 120_000;    // ждём LIVE до 2 минут
-const MAX_QUEUE = 1000;             // максимум mint в API-очереди
+const MIN_GAP_MS = 1500;
+const MAX_LIFETIME_MS = 120_000;
+const MAX_QUEUE = 1000;
 const MAX_RETRIES = 2;
 
 // === Тюнинг очереди зрителей ===
-const VIEWERS_THRESHOLD = 30;       // порог зрителей
-const VIEWERS_WINDOW_MS = 30_000;   // окно наблюдения 30с
-const VIEWERS_STEP_MS = 5_000;      // шаг 5с
-const VIEWERS_ITER = Math.floor(VIEWERS_WINDOW_MS / VIEWERS_STEP_MS); // 6 замеров
-const VIEWERS_QUEUE_MAX = 200;      // максимум задач в очереди зрителей
-const VIEWERS_CONCURRENCY = 1;      // 1 поток (начни с 1, потом можно 2)
-const VIEWERS_DELAY_BETWEEN_TASKS = 3000; // пауза между задачами
-const VIEWERS_PAGE_TIMEOUT = 10_000; // таймаут загрузки страницы
-const VIEWERS_TASK_TIMEOUT = 35_000; // общий таймаут задачи
+const VIEWERS_THRESHOLD = 30;
+const VIEWERS_WINDOW_MS = 30_000;
+const VIEWERS_STEP_MS = 5_000;
+const VIEWERS_ITER = Math.floor(VIEWERS_WINDOW_MS / VIEWERS_STEP_MS);
+const VIEWERS_QUEUE_MAX = 200;
+const VIEWERS_CONCURRENCY = 1;
+const VIEWERS_DELAY_BETWEEN_TASKS = 3000;
+const VIEWERS_PAGE_TIMEOUT = 10_000;
+const VIEWERS_TASK_TIMEOUT = 35_000;
 
 let ws;
 let lastWsMsgAt = 0;
 let lastLiveAt = 0;
 
-// ——— метрики
 const metrics = {
   requests: 0, ok: 0, retries: 0,
   http429: 0, httpOther: 0,
@@ -41,18 +41,14 @@ const metrics = {
   viewerOpenErrors: 0, viewerSelectorMiss: 0,
 };
 
-// ——— лог и глобальный троттлер
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 let nextAvailableAt = 0;
 async function throttle() {
   const now = Date.now();
-  if (now < nextAvailableAt) {
-    await new Promise(r => setTimeout(r, nextAvailableAt - now));
-  }
+  if (now < nextAvailableAt) await new Promise(r => setTimeout(r, nextAvailableAt - now));
   nextAvailableAt = Date.now() + MIN_GAP_MS;
 }
 
-// ——— безопасный GET JSON
 async function safeGetJson(url) {
   metrics.requests++;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -62,10 +58,9 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/6.0.1"
+          "user-agent": "pumplive-watcher/6.1.0"
         }
       });
-
       if (r.status === 429) {
         metrics.http429++;
         const waitMs = 2000 + Math.random() * 2000;
@@ -73,18 +68,15 @@ async function safeGetJson(url) {
         await new Promise(res => setTimeout(res, waitMs));
         continue;
       }
-
       if (!r.ok) {
         metrics.httpOther++;
         throw new Error(`HTTP ${r.status}`);
       }
-
       const text = await r.text();
       if (!text || text.trim() === "") {
         metrics.emptyBody++;
         throw new Error("Empty body");
       }
-
       metrics.ok++;
       return JSON.parse(text);
     } catch (e) {
@@ -99,7 +91,6 @@ async function safeGetJson(url) {
   }
 }
 
-// ——— форматтеры
 function formatNumber(n) {
   return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
@@ -112,7 +103,6 @@ function extractOfficialSocials(coin) {
   return socials;
 }
 
-// ——— Telegram
 async function sendTG({ text, photo }) {
   if (!TG_TOKEN || !TG_CHAT_ID) return;
   try {
@@ -120,22 +110,13 @@ async function sendTG({ text, photo }) {
       await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          chat_id: TG_CHAT_ID,
-          photo,
-          caption: text,
-          parse_mode: "HTML"
-        })
+        body: JSON.stringify({ chat_id: TG_CHAT_ID, photo, caption: text, parse_mode: "HTML" })
       });
     } else {
       await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          chat_id: TG_CHAT_ID,
-          text,
-          parse_mode: "HTML"
-        })
+        body: JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: "HTML" })
       });
     }
   } catch (e) {
@@ -143,93 +124,52 @@ async function sendTG({ text, photo }) {
   }
 }
 
-// =====================
-//       API ОЧЕРЕДЬ
-// =====================
-const inQueue = new Set(); // дедупликация по mint
-const queue = [];          // [{ mint, name, symbol, enqueuedAt, expiresAt, nextTryAt }]
-
+// ===================== API ОЧЕРЕДЬ =====================
+const inQueue = new Set();
+const queue = [];
 function enqueue(mint, name = "", symbol = "") {
   if (inQueue.has(mint)) return;
   if (inQueue.size >= MAX_QUEUE) return;
   const now = Date.now();
-  queue.push({
-    mint,
-    name,
-    symbol,
-    enqueuedAt: now,
-    expiresAt: now + MAX_LIFETIME_MS,
-    nextTryAt: now
-  });
+  queue.push({ mint, name, symbol, enqueuedAt: now, expiresAt: now + MAX_LIFETIME_MS, nextTryAt: now });
   inQueue.add(mint);
 }
-
-function requeue(item) {
-  item.nextTryAt = Date.now() + 4000;
-  queue.push(item);
-}
-
-function queueSize() {
-  return inQueue.size;
-}
+function requeue(item) { item.nextTryAt = Date.now() + 4000; queue.push(item); }
+function queueSize() { return inQueue.size; }
 
 async function apiWorkerLoop() {
   while (true) {
-    let idx = -1;
-    const now = Date.now();
-    for (let i = 0; i < queue.length; i++) {
-      if (queue[i].nextTryAt <= now) { idx = i; break; }
-    }
-
-    if (idx === -1) {
-      await new Promise(r => setTimeout(r, 250));
-      continue;
-    }
+    let idx = -1; const now = Date.now();
+    for (let i = 0; i < queue.length; i++) if (queue[i].nextTryAt <= now) { idx = i; break; }
+    if (idx === -1) { await new Promise(r => setTimeout(r, 250)); continue; }
 
     const item = queue.splice(idx, 1)[0];
     const { mint, name, symbol, expiresAt } = item;
-
-    if (Date.now() > expiresAt) {
-      inQueue.delete(mint);
-      continue;
-    }
+    if (Date.now() > expiresAt) { inQueue.delete(mint); continue; }
 
     const coin = await safeGetJson(`${API}/coins/${mint}`);
-    if (!coin) {
-      requeue(item);
-      continue;
-    }
+    if (!coin) { requeue(item); continue; }
 
     if (coin.is_currently_live) {
       const socials = extractOfficialSocials(coin);
-      if (socials.length === 0) { // твоя логика: без оф. соцсетей — пропуск
-        inQueue.delete(mint);
-        continue;
-      }
+      if (socials.length === 0) { inQueue.delete(mint); continue; }
 
-      // готово к viewers-проверке
       inQueue.delete(mint);
       enqueueViewers({ mint, coin, fallbackName: name, fallbackSymbol: symbol });
       lastLiveAt = Date.now();
 
-      // лог как раньше
       log(`🎥 LIVE START | ${coin.name || name} (${coin.symbol || symbol})`);
       log(`   mint: ${mint}`);
-      if (typeof coin.usd_market_cap === "number")
-        log(`   mcap_usd: ${coin.usd_market_cap.toFixed(2)}`);
+      if (typeof coin.usd_market_cap === "number") log(`   mcap_usd: ${coin.usd_market_cap.toFixed(2)}`);
       log(`   socials: ${socials.join("  ")}`);
-
       continue;
     }
 
-    // ещё не LIVE — вернём в очередь до истечения времени
     requeue(item);
   }
 }
 
-// =====================
-//   ОЧЕРЕДЬ ЗРИТЕЛЕЙ
-// =====================
+// ===================== ОЧЕРЕДЬ ЗРИТЕЛЕЙ =====================
 const viewersQueue = [];
 const viewersInQueue = new Set();
 let browser = null;
@@ -237,10 +177,7 @@ let viewersActive = 0;
 
 function enqueueViewers({ mint, coin, fallbackName = "", fallbackSymbol = "" }) {
   if (viewersInQueue.has(mint)) return;
-  if (viewersQueue.length >= VIEWERS_QUEUE_MAX) {
-    metrics.viewerTasksDropped++;
-    return;
-  }
+  if (viewersQueue.length >= VIEWERS_QUEUE_MAX) { metrics.viewerTasksDropped++; return; }
   viewersQueue.push({ mint, coin, fallbackName, fallbackSymbol, enqueuedAt: Date.now() });
   viewersInQueue.add(mint);
 }
@@ -248,16 +185,15 @@ function enqueueViewers({ mint, coin, fallbackName = "", fallbackSymbol = "" }) 
 async function getBrowser() {
   if (browser) return browser;
 
-  // ЯВНО берём путь к Chrome, установленному postinstall’ом
-  const execPath = await puppeteer.executablePath();
-
+  // chromium from @sparticuz/chromium (serverless-friendly)
+  const execPath = await chromium.executablePath();
   browser = await puppeteer.launch({
     executablePath: execPath,
-    args: ["--no-sandbox", "--disable-setuid-sandbox"],
-    headless: true
+    args: [...chromium.args, "--no-sandbox", "--disable-setuid-sandbox"],
+    headless: chromium.headless
   });
 
-  log("✅ Puppeteer ready:", execPath);
+  log("✅ Chromium ready:", execPath);
   return browser;
 }
 
@@ -281,10 +217,7 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
   try {
     const br = await getBrowser();
     page = await br.newPage();
-    await page.goto(`https://pump.fun/coin/${mint}`, {
-      waitUntil: "domcontentloaded",
-      timeout: VIEWERS_PAGE_TIMEOUT
-    });
+    await page.goto(`https://pump.fun/coin/${mint}`, { waitUntil: "domcontentloaded", timeout: VIEWERS_PAGE_TIMEOUT });
 
     let maxV = -1;
     let sent = false;
@@ -292,20 +225,15 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
     for (let i = 0; i < VIEWERS_ITER; i++) {
       const res = await checkViewersOnce(page);
       if (!res.ok) {
-        if (res.reason === "no_live_indicator" || res.reason === "no_viewers_span") {
-          metrics.viewerSelectorMiss++;
-        }
+        if (res.reason === "no_live_indicator" || res.reason === "no_viewers_span") metrics.viewerSelectorMiss++;
       } else {
         if (res.viewers > maxV) maxV = res.viewers;
         if (res.viewers >= VIEWERS_THRESHOLD) {
           await notifyTelegram(mint, coin, fallbackName, fallbackSymbol, res.viewers);
-          sent = true;
-          break;
+          sent = true; break;
         }
       }
-      if (i < VIEWERS_ITER - 1) {
-        await new Promise(r => setTimeout(r, VIEWERS_STEP_MS));
-      }
+      if (i < VIEWERS_ITER - 1) await new Promise(r => setTimeout(r, VIEWERS_STEP_MS));
     }
 
     if (!sent && maxV >= VIEWERS_THRESHOLD) {
@@ -313,7 +241,6 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
       sent = true;
     }
 
-    // если не отправили — просто дропаем
     metrics.viewerTasksDone++;
   } catch (e) {
     metrics.viewerOpenErrors++;
@@ -326,9 +253,7 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
 async function notifyTelegram(mint, coin, fallbackName, fallbackSymbol, viewers) {
   const socials = extractOfficialSocials(coin);
   const title = `${coin.name || fallbackName} (${coin.symbol || fallbackSymbol})`;
-  const mcapStr = typeof coin.usd_market_cap === "number"
-    ? `$${formatNumber(coin.usd_market_cap)}`
-    : "n/a";
+  const mcapStr = typeof coin.usd_market_cap === "number" ? `$${formatNumber(coin.usd_market_cap)}` : "n/a";
   const msg = [
     `🎥 <b>LIVE START</b> | ${title}`,
     ``,
@@ -341,7 +266,6 @@ async function notifyTelegram(mint, coin, fallbackName, fallbackSymbol, viewers)
   ].join("\n");
 
   const photoUrl = coin?.image_uri || null;
-
   log("📤 sending to Telegram…");
   sendTG({ text: msg, photo: photoUrl })
     .then(() => log("✅ sent to Telegram"))
@@ -360,56 +284,34 @@ async function viewersWorkerLoop() {
     viewersActive++;
     const task = viewersTask(job);
 
-    // Ограничиваем общее время задачи (safety)
     const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("viewer task timeout")), VIEWERS_TASK_TIMEOUT));
-    try {
-      await Promise.race([task, timeout]);
-    } catch (e) {
-      metrics.viewerTasksDropped++;
-      log("⚠️ viewers task dropped:", e.message);
-    } finally {
-      viewersActive--;
-      await new Promise(r => setTimeout(r, VIEWERS_DELAY_BETWEEN_TASKS));
-    }
+    try { await Promise.race([task, timeout]); }
+    catch (e) { metrics.viewerTasksDropped++; log("⚠️ viewers task dropped:", e.message); }
+    finally { viewersActive--; await new Promise(r => setTimeout(r, VIEWERS_DELAY_BETWEEN_TASKS)); }
   }
 }
 
-// =====================
-//      WebSocket
-// =====================
+// ===================== WebSocket =====================
 function connect() {
   ws = new WebSocket(WS_URL);
-
   ws.on("open", () => {
     log("✅ WS connected, subscribing to new tokens…");
     ws.send(JSON.stringify({ method: "subscribeNewToken" }));
   });
-
   ws.on("message", (raw) => {
     lastWsMsgAt = Date.now();
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     const mint = msg?.mint || msg?.tokenMint || msg?.ca || null;
     if (!mint) return;
-
     const nm = msg?.name || msg?.tokenName || "";
     const sm = msg?.symbol || msg?.ticker || "";
-
     enqueue(mint, nm, sm);
   });
-
-  ws.on("close", () => {
-    metrics.reconnects++;
-    log(`🔌 WS closed → Reconnecting in 5s…`);
-    setTimeout(connect, 5000);
-  });
-
+  ws.on("close", () => { metrics.reconnects++; log(`🔌 WS closed → Reconnecting in 5s…`); setTimeout(connect, 5000); });
   ws.on("error", (e) => log("❌ WS error:", e.message));
 }
 
-// =====================
-//      Heartbeat
-// =====================
+// ===================== Heartbeat =====================
 setInterval(() => {
   const now = Date.now();
   const secSinceWs = lastWsMsgAt ? Math.round((now - lastWsMsgAt) / 1000) : -1;
@@ -422,27 +324,14 @@ setInterval(() => {
     `vQ=${viewersQueue.length}/${VIEWERS_QUEUE_MAX} vRun=${viewersActive} ` +
     `vStart=${metrics.viewerTasksStarted} vDone=${metrics.viewerTasksDone} vDrop=${metrics.viewerTasksDropped}`
   );
-
-  if (secSinceWs >= 0 && secSinceWs > 300) {
-    console.log(`[guard] no WS messages for ${secSinceWs}s → force reconnect`);
-    try { ws?.terminate(); } catch {}
-  }
+  if (secSinceWs >= 0 && secSinceWs > 300) { console.log(`[guard] no WS messages for ${secSinceWs}s → force reconnect`); try { ws?.terminate(); } catch {} }
 }, 60_000);
 
-// =====================
-//       Start!
-// =====================
+// ===================== Start =====================
 log("Worker starting…");
 connect();
 apiWorkerLoop();
 viewersWorkerLoop();
 
-// ——— аккуратное завершение
-process.on("SIGTERM", async () => {
-  try { await browser?.close(); } catch {}
-  process.exit(0);
-});
-process.on("SIGINT", async () => {
-  try { await browser?.close(); } catch {}
-  process.exit(0);
-});
+process.on("SIGTERM", async () => { try { await browser?.close(); } catch {} process.exit(0); });
+process.on("SIGINT",  async () => { try { await browser?.close(); } catch {} process.exit(0); });
