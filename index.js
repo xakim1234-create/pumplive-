@@ -1,4 +1,9 @@
-// index.js — v7.4.0
+// index.js — v7.5.0
+// - Предпроверка API перед запуском Chromium (если уже не LIVE — сразу skip)
+// - Ожидание индикатора до 60s, затем 2 замера (каждые 5s)
+// - Таймлайновые метрики: detect→taskStart, taskStart→navDone, navDone→indicator, indicator→samples, detect→checked
+// - Монитор ресурсов: CPU/RAM/Chrome/active_pages
+
 import WebSocket from "ws";
 import fetch from "node-fetch";
 import chromium from "@sparticuz/chromium";
@@ -9,9 +14,9 @@ import fs from "fs/promises";
 const WS_URL = "wss://pumpportal.fun/api/data";
 const API = "https://frontend-api-v3.pump.fun";
 
-// === Telegram
-const TG_TOKEN = "XXX";
-const TG_CHAT_ID = "YYY";
+// === Telegram (используй ENV)
+const TG_TOKEN = process.env.TG_TOKEN || "";
+const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
 
 // === API очередь ===
 const MIN_GAP_MS = 1500;
@@ -21,6 +26,8 @@ const MAX_RETRIES = 2;
 
 // === Viewers ===
 const VIEWERS_THRESHOLD = 30;
+const INDICATOR_WAIT_MS = 60_000;
+const SAMPLE_STEP_MS = 5_000; // 2 сэмпла по 5s = ~10s
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 
@@ -39,13 +46,16 @@ const metrics = {
 };
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
+const now = () => Date.now();
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const dt = (ms) => `${ms}ms`;
 
 // ——— throttle
 let nextAvailableAt = 0;
 async function throttle() {
-  const now = Date.now();
-  if (now < nextAvailableAt) await new Promise(r => setTimeout(r, nextAvailableAt - now));
-  nextAvailableAt = Date.now() + MIN_GAP_MS;
+  const t = now();
+  if (t < nextAvailableAt) await sleep(nextAvailableAt - t);
+  nextAvailableAt = now() + MIN_GAP_MS;
 }
 
 // ——— safeGetJson
@@ -58,14 +68,14 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/7.4.0"
+          "user-agent": "pumplive-watcher/7.5.0"
         }
       });
       if (r.status === 429) {
         metrics.http429++;
         const waitMs = 2000 + Math.random() * 2000;
-        nextAvailableAt = Date.now() + waitMs;
-        await new Promise(res => setTimeout(res, waitMs));
+        nextAvailableAt = now() + waitMs;
+        await sleep(waitMs);
         continue;
       }
       if (!r.ok) {
@@ -79,10 +89,10 @@ async function safeGetJson(url) {
       }
       metrics.ok++;
       return JSON.parse(text);
-    } catch {
+    } catch (e) {
       if (attempt < MAX_RETRIES) {
         metrics.retries++;
-        await new Promise(res => setTimeout(res, 400 * (attempt + 1)));
+        await sleep(400 * (attempt + 1));
         continue;
       }
       metrics.skippedNull++;
@@ -93,12 +103,12 @@ async function safeGetJson(url) {
 
 // ——— socials
 function extractOfficialSocials(coin) {
-  const socials = [];
-  if (coin?.website) socials.push(`🌐 <b>Website:</b> ${coin.website}`);
-  if (coin?.twitter) socials.push(`🐦 <b>Twitter:</b> ${coin.twitter}`);
-  if (coin?.telegram) socials.push(`💬 <b>Telegram:</b> ${coin.telegram}`);
-  if (coin?.discord) socials.push(`🎮 <b>Discord:</b> ${coin.discord}`);
-  return socials;
+  const s = [];
+  if (coin?.website) s.push(`🌐 <b>Website:</b> ${coin.website}`);
+  if (coin?.twitter) s.push(`🐦 <b>Twitter:</b> ${coin.twitter}`);
+  if (coin?.telegram) s.push(`💬 <b>Telegram:</b> ${coin.telegram}`);
+  if (coin?.discord) s.push(`🎮 <b>Discord:</b> ${coin.discord}`);
+  return s;
 }
 
 // ——— Telegram
@@ -125,27 +135,27 @@ async function sendTG({ text, photo }) {
 
 // ===================== API очередь =====================
 const inQueue = new Set();
-const queue = [];
+const queue = []; // items: { mint, name, symbol, enqueuedAt, expiresAt, nextTryAt }
 
 function enqueue(mint, name = "", symbol = "") {
   if (inQueue.has(mint)) return;
   if (inQueue.size >= MAX_QUEUE) return;
-  const now = Date.now();
-  queue.push({ mint, name, symbol, enqueuedAt: now, expiresAt: now + MAX_LIFETIME_MS, nextTryAt: now });
+  const t = now();
+  queue.push({ mint, name, symbol, enqueuedAt: t, expiresAt: t + MAX_LIFETIME_MS, nextTryAt: t });
   inQueue.add(mint);
 }
-function requeue(item) { item.nextTryAt = Date.now() + 4000; queue.push(item); }
+function requeue(item) { item.nextTryAt = now() + 4000; queue.push(item); }
 function queueSize() { return inQueue.size; }
 
 async function apiWorkerLoop() {
   while (true) {
-    let idx = -1; const now = Date.now();
-    for (let i = 0; i < queue.length; i++) if (queue[i].nextTryAt <= now) { idx = i; break; }
-    if (idx === -1) { await new Promise(r => setTimeout(r, 250)); continue; }
+    let idx = -1; const t = now();
+    for (let i = 0; i < queue.length; i++) if (queue[i].nextTryAt <= t) { idx = i; break; }
+    if (idx === -1) { await sleep(250); continue; }
 
     const item = queue.splice(idx, 1)[0];
-    const { mint, name, symbol, expiresAt } = item;
-    if (Date.now() > expiresAt) { inQueue.delete(mint); continue; }
+    const { mint, name, symbol, expiresAt, enqueuedAt } = item;
+    if (now() > expiresAt) { inQueue.delete(mint); continue; }
 
     const coin = await safeGetJson(`${API}/coins/${mint}`);
     if (!coin) { requeue(item); continue; }
@@ -155,8 +165,8 @@ async function apiWorkerLoop() {
       if (socials.length === 0) { inQueue.delete(mint); continue; }
 
       inQueue.delete(mint);
-      viewersQueue.push({ mint, coin, fallbackName: name, fallbackSymbol: symbol });
-      lastLiveAt = Date.now();
+      enqueueViewers({ mint, coin, fallbackName: name, fallbackSymbol: symbol, detectedAt: now(), enqueuedAt });
+      lastLiveAt = now();
 
       log(`🎥 LIVE START | ${coin.name || name} (${coin.symbol || symbol})`);
       log(`   mint: ${mint}`);
@@ -172,120 +182,210 @@ async function apiWorkerLoop() {
 // ===================== Viewers =====================
 const viewersQueue = [];
 let browser = null;
+let viewersActive = 0; // concurrency 1 (можно поднять позже)
+
+function enqueueViewers({ mint, coin, fallbackName = "", fallbackSymbol = "", detectedAt, enqueuedAt }) {
+  viewersQueue.push({ mint, coin, fallbackName, fallbackSymbol, detectedAt, enqueuedAt });
+}
 
 async function getBrowser() {
   if (browser) return browser;
   const execPath = await chromium.executablePath();
   browser = await puppeteer.launch({
     executablePath: execPath,
-    args: [...chromium.args, "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-    headless: chromium.headless
+    args: [
+      ...chromium.args,
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--single-process",
+      "--disable-gpu"
+    ],
+    headless: chromium.headless,
+    protocolTimeout: 180_000
   });
   log("✅ Chromium ready:", execPath);
   return browser;
 }
 
-async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
-  metrics.viewerTasksStarted++;
-  const br = await getBrowser();
-  const pg = await br.newPage();
-  await pg.setUserAgent(UA);
-  await pg.setViewport({ width: 1280, height: 800 });
-  await pg.setRequestInterception(true);
-  pg.on("request", req => {
-    const t = req.resourceType();
-    if (t === "image" || t === "font" || t === "media" || t === "stylesheet") return req.abort();
-    req.continue();
+// ——— единичная выборка зрителей (через fallback селекторы)
+async function checkViewersOnce(pg) {
+  return await pg.evaluate(() => {
+    const pick = (txt) => {
+      const m = (txt || "").match(/\d{1,6}/);
+      return m ? Number(m[0]) : null;
+    };
+    const roots = [
+      document.querySelector('#live-indicator'),
+      document.querySelector('[data-testid*="live" i]'),
+      document.querySelector('[class*="live"][class*="indicator"]'),
+      Array.from(document.querySelectorAll('span,div,b,strong')).find(n => /live/i.test(n.textContent || '')) || null,
+    ].filter(Boolean);
+
+    for (const root of roots) {
+      let span = root.querySelector(':scope > span') ||
+                 root.parentElement?.querySelector('span') ||
+                 root.closest('div')?.querySelector('span');
+      const n = span ? pick(span.textContent) : null;
+      if (Number.isFinite(n)) return { ok: true, viewers: n };
+    }
+    return { ok: false, reason: 'no_live_indicator' };
   });
+}
 
-  log(`▶️ viewers:start mint=${mint} name="${coin.name || fallbackName}" symbol="${coin.symbol || fallbackSymbol}"`);
+async function viewersTask(job) {
+  const { mint, coin, fallbackName, fallbackSymbol, detectedAt, enqueuedAt } = job;
+  metrics.viewerTasksStarted++;
+  const taskStartAt = now();
 
-  await pg.goto(`https://pump.fun/coin/${mint}`, { waitUntil: "domcontentloaded", timeout: 30_000 });
-  await new Promise(r => setTimeout(r, 1500));
+  // ——— Пред-проверка API до поднятия браузера
+  const preApi = await safeGetJson(`${API}/coins/${mint}`);
+  if (!preApi?.is_currently_live) {
+    const tDetectToNow = taskStartAt - detectedAt;
+    log(`⏭️ skip before_browser mint=${mint} reason=already_not_live t_detect→taskStart=${dt(tDetectToNow)}`);
+    metrics.viewerTasksDone++;
+    return;
+  }
 
-  const tSel = Date.now();
-  let indicatorFound = true;
+  let br, pg;
   try {
-    await pg.waitForSelector("#live-indicator", { timeout: 60_000 });
-    log(`🔎 live-indicator:found=true dt=${Date.now() - tSel}ms`);
-  } catch {
-    indicatorFound = false;
-    metrics.viewerSelectorMiss++;
-    log(`🔎 live-indicator:found=false dt=${Date.now() - tSel}ms reason=timeout_or_missing`);
+    br = await getBrowser();
+    pg = await br.newPage();
+    await pg.setUserAgent(UA);
+    await pg.setViewport({ width: 1280, height: 800 });
+    await pg.setRequestInterception(true);
+    pg.on("request", req => {
+      const t = req.resourceType();
+      if (t === "image" || t === "font" || t === "media" || t === "stylesheet") return req.abort();
+      req.continue();
+    });
+    pg.setDefaultTimeout(60_000);
+    pg.setDefaultNavigationTimeout(60_000);
 
-    // перепроверяем API
-    let apiLive = null;
-    try {
-      const fresh = await safeGetJson(`${API}/coins/${mint}`);
-      apiLive = !!fresh?.is_currently_live;
-    } catch {}
-    log(`🔁 api:recheck_live=${apiLive}`);
-    if (!apiLive) {
+    log(`▶️ viewers:start mint=${mint} name="${coin?.name || fallbackName}" symbol="${coin?.symbol || fallbackSymbol}"`);
+
+    // ——— Навигация
+    const navStartAt = now();
+    const url = `https://pump.fun/coin/${mint}`;
+    log(`🌐 goto:start url=${url}`);
+    await pg.goto(url, { waitUntil: "domcontentloaded" });
+    await sleep(1500);
+    const navDoneAt = now();
+    log(`🌐 goto:done dt_nav=${dt(navDoneAt - navStartAt)} wait_dom_extra=1500ms`);
+
+    // ——— Перед ожиданием индикатора: повторная проверка API (на случай, что токен умер во время навигации)
+    const midApi = await safeGetJson(`${API}/coins/${mint}`);
+    if (!midApi?.is_currently_live) {
+      const tDetectToNow2 = now() - detectedAt;
+      log(`⏭️ skip mid_check reason=not_live_anymore t_detect→now=${dt(tDetectToNow2)}`);
       metrics.viewerTasksDone++;
       await pg.close();
       log(`🗑 page:closed active_pages=${(await br.pages()).length}`);
-      log(`⏭️ skip reason=no_indicator_and_not_live`);
       return;
-    } else {
+    }
+
+    // ——— Ожидание индикатора
+    const selStartAt = now();
+    let indicatorFound = true;
+    try {
+      await pg.waitForSelector("#live-indicator", { timeout: INDICATOR_WAIT_MS });
+      log(`🔎 live-indicator:found=true dt=${dt(now() - selStartAt)}`);
+    } catch {
+      indicatorFound = false;
+      metrics.viewerSelectorMiss++;
+      log(`🔎 live-indicator:found=false dt=${dt(now() - selStartAt)} reason=timeout_or_missing`);
+
+      // Финальная перепроверка API
+      const finalApi = await safeGetJson(`${API}/coins/${mint}`);
+      const apiLive = !!finalApi?.is_currently_live;
+      log(`🔁 api:recheck_live=${apiLive}`);
       metrics.viewerTasksDone++;
       await pg.close();
       log(`🗑 page:closed active_pages=${(await br.pages()).length}`);
-      log(`⏭️ skip reason=no_indicator_but_still_live`);
+      log(`⏭️ skip reason=${apiLive ? 'no_indicator_but_still_live' : 'no_indicator_and_not_live'} ` +
+          `timeline detect→taskStart=${dt(taskStartAt - detectedAt)} ` +
+          `taskStart→navDone=${dt(navDoneAt - taskStartAt)} ` +
+          `navDone→indicatorWait=${dt(now() - navDoneAt)} ` +
+          `detect→skip=${dt(now() - detectedAt)}`);
       return;
     }
-  }
 
-  // если индикатор найден → 2 замера
-  let maxV = -1;
-  for (let i = 1; i <= 2; i++) {
-    await new Promise(r => setTimeout(r, 5000));
-    let viewers = null;
-    try {
-      const handle = await pg.$("#live-indicator");
-      const span = await pg.evaluateHandle(el => el && el.parentElement && el.parentElement.querySelector("span"), handle);
-      const txt = await span.evaluate(el => (el.textContent || "").trim());
-      const num = Number((txt.match(/\d+/) || [null])[0]);
-      if (Number.isFinite(num)) viewers = num;
-    } catch {}
-    if (viewers != null) {
-      if (viewers > maxV) maxV = viewers;
-      log(`📊 sample i=${i}/2 ok=true viewers=${viewers}`);
-    } else {
-      log(`📊 sample i=${i}/2 ok=false`);
+    // ——— 2 замера (по 5s)
+    let maxV = -1;
+    const measStartAt = now();
+    for (let i = 1; i <= 2; i++) {
+      const res = await checkViewersOnce(pg);
+      if (res.ok) {
+        maxV = Math.max(maxV, res.viewers);
+        log(`📊 sample i=${i}/2 ok=true viewers=${res.viewers}`);
+      } else {
+        log(`📊 sample i=${i}/2 ok=false reason=${res.reason}`);
+      }
+      if (i < 2) await sleep(SAMPLE_STEP_MS);
     }
-  }
+    const measDoneAt = now();
 
-  if (maxV >= VIEWERS_THRESHOLD) {
-    const socials = extractOfficialSocials(coin);
-    const title = `${coin.name || fallbackName} (${coin.symbol || fallbackSymbol})`;
-    const mcapStr = typeof coin.usd_market_cap === "number" ? `$${coin.usd_market_cap.toFixed(2)}` : "n/a";
-    const msg = [
-      `🎥 <b>LIVE START</b> | ${title}`,
-      ``,
-      `Mint: <code>${mint}</code>`,
-      `💰 Market Cap: ${mcapStr}`,
-      `👁 Viewers: ${maxV}`,
-      ``,
-      socials.join("\n")
-    ].join("\n");
-    log("📤 tg:send start");
-    await sendTG({ text: msg, photo: coin?.image_uri || null });
-    log("✅ tg:sent");
-  } else {
-    log(`⏭️ threshold:miss max=${maxV}`);
-  }
+    // ——— Таймлайны
+    const tDetectToTaskStart = taskStartAt - detectedAt;
+    const tTaskStartToNavDone = navDoneAt - taskStartAt;
+    const tNavDoneToIndicator = selStartAt - navDoneAt; // время до начала ожидания
+    const tIndicatorToSamples = measDoneAt - selStartAt;
+    const tDetectToChecked = measDoneAt - detectedAt;
 
-  metrics.viewerTasksDone++;
-  await pg.close();
-  log(`🗑 page:closed active_pages=${(await br.pages()).length}`);
+    if (maxV >= VIEWERS_THRESHOLD) {
+      const socials = extractOfficialSocials(coin);
+      const title = `${coin?.name || fallbackName} (${coin?.symbol || fallbackSymbol})`;
+      const mcapStr = typeof coin.usd_market_cap === "number" ? `$${coin.usd_market_cap.toFixed(2)}` : "n/a";
+      const msg = [
+        `🎥 <b>LIVE START</b> | ${title}`,
+        ``,
+        `Mint: <code>${mint}</code>`,
+        `💰 Market Cap: ${mcapStr}`,
+        `👁 Viewers: ${maxV}`,
+        ``,
+        socials.join("\n")
+      ].join("\n");
+
+      log(`✅ threshold:hit viewers=${maxV} ` +
+          `timeline detect→taskStart=${dt(tDetectToTaskStart)} ` +
+          `taskStart→navDone=${dt(tTaskStartToNavDone)} ` +
+          `navDone→indicator=${dt(tNavDoneToIndicator)} ` +
+          `indicator→samples=${dt(tIndicatorToSamples)} ` +
+          `detect→checked=${dt(tDetectToChecked)}`);
+
+      log("📤 tg:send start");
+      await sendTG({ text: msg, photo: coin?.image_uri || null });
+      log("✅ tg:sent");
+    } else {
+      log(`⏭️ threshold:miss max=${maxV} ` +
+          `timeline detect→taskStart=${dt(tDetectToTaskStart)} ` +
+          `taskStart→navDone=${dt(tTaskStartToNavDone)} ` +
+          `navDone→indicator=${dt(tNavDoneToIndicator)} ` +
+          `indicator→samples=${dt(tIndicatorToSamples)} ` +
+          `detect→checked=${dt(tDetectToChecked)}`);
+    }
+
+    metrics.viewerTasksDone++;
+    await pg.close();
+    log(`🗑 page:closed active_pages=${(await br.pages()).length}`);
+  } catch (e) {
+    metrics.viewerOpenErrors++;
+    log(`⚠️ viewers task error: ${e.message}`);
+    try { await pg?.close(); log(`🗑 page:closed after error active_pages=${(await browser?.pages())?.length ?? 0}`); } catch {}
+  }
 }
 
 async function viewersWorkerLoop() {
   while (true) {
-    if (viewersQueue.length === 0) { await new Promise(r => setTimeout(r, 200)); continue; }
+    if (viewersActive >= 1 || viewersQueue.length === 0) {
+      await sleep(100);
+      continue;
+    }
     const job = viewersQueue.shift();
+    viewersActive++;
     try { await viewersTask(job); }
-    catch (e) { metrics.viewerOpenErrors++; log("⚠️ viewers task error:", e.message); }
+    catch (e) { metrics.viewerTasksDropped++; log("⚠️ viewers task dropped:", e.message); }
+    finally { viewersActive--; await sleep(200); }
   }
 }
 
@@ -297,7 +397,7 @@ function connect() {
     ws.send(JSON.stringify({ method: "subscribeNewToken" }));
   });
   ws.on("message", raw => {
-    lastWsMsgAt = Date.now();
+    lastWsMsgAt = now();
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     const mint = msg?.mint || msg?.tokenMint || msg?.ca || null;
     if (!mint) return;
@@ -313,19 +413,25 @@ function connect() {
   ws.on("error", (e) => log("❌ WS error:", e.message));
 }
 
-// ===================== Heartbeat + Resources =====================
-setInterval(() => {
-  const now = Date.now();
-  const secSinceWs = lastWsMsgAt ? Math.round((now - lastWsMsgAt) / 1000) : -1;
-  const minSinceLive = lastLiveAt ? Math.round((now - lastLiveAt) / 60000) : -1;
+// ===================== Heartbeat =====================
+setInterval(async () => {
+  const t = now();
+  const secSinceWs = lastWsMsgAt ? Math.round((t - lastWsMsgAt) / 1000) : -1;
+  const minSinceLive = lastLiveAt ? Math.round((t - lastLiveAt) / 60000) : -1;
+  const pages = browser ? await browser.pages() : [];
   console.log(
     `[stats] watchers=${queueSize()}  ws_last=${secSinceWs}s  live_last=${minSinceLive}m  ` +
     `req=${metrics.requests} ok=${metrics.ok} retries=${metrics.retries} ` +
     `429=${metrics.http429} other=${metrics.httpOther} empty=${metrics.emptyBody} ` +
     `null=${metrics.skippedNull} reconnects=${metrics.reconnects}  ` +
-    `vQ=${viewersQueue.length} vStart=${metrics.viewerTasksStarted} vDone=${metrics.viewerTasksDone} ` +
-    `vDrop=${metrics.viewerTasksDropped} vOpenErr=${metrics.viewerOpenErrors} vSelMiss=${metrics.viewerSelectorMiss}`
+    `vQ=${viewersQueue.length} vRun=${viewersActive} ` +
+    `vStart=${metrics.viewerTasksStarted} vDone=${metrics.viewerTasksDone} vDrop=${metrics.viewerTasksDropped} ` +
+    `vOpenErr=${metrics.viewerOpenErrors} vSelMiss=${metrics.viewerSelectorMiss} active_pages=${pages.length}`
   );
+  if (secSinceWs >= 0 && secSinceWs > 300) {
+    console.log(`[guard] no WS messages for ${secSinceWs}s → force reconnect`);
+    try { ws?.terminate(); } catch {}
+  }
 }, 60_000);
 
 // ==== RESOURCE MONITOR ======================
@@ -341,22 +447,25 @@ async function readProcStatm(pid) {
 }
 function startResourceLogger(intervalMs = 15000) {
   let lastCpu = process.cpuUsage();
-  let lastTime = Date.now();
+  let lastTime = now();
   setInterval(async () => {
-    const now = Date.now();
+    const nowT = now();
     const cpu = process.cpuUsage(lastCpu);
-    const elapsedMs = now - lastTime || 1;
+    const elapsedMs = nowT - lastTime || 1;
     lastCpu = process.cpuUsage();
-    lastTime = now;
+    lastTime = nowT;
     const cpuMs = (cpu.user + cpu.system) / 1000;
     const cores = os.cpus().length || 1;
     const nodeCpuPct = (cpuMs / elapsedMs) * 100 / cores;
+
     const mem = process.memoryUsage();
     const nodeRssMB = fmtMB(mem.rss);
     const nodeHeapMB = fmtMB(mem.heapUsed);
     const [load1] = os.loadavg();
+
     let activePages = 0;
     try { activePages = browser ? (await browser.pages()).length : 0; } catch {}
+
     let chromeRssMB = null;
     try {
       const bproc = browser?.process?.();
@@ -365,6 +474,7 @@ function startResourceLogger(intervalMs = 15000) {
         if (rss != null) chromeRssMB = fmtMB(rss);
       }
     } catch {}
+
     console.log(
       new Date().toISOString(),
       `[res] cpu_node=${nodeCpuPct.toFixed(1)}% rss_node=${nodeRssMB}MB heap_node=${nodeHeapMB}MB ` +
