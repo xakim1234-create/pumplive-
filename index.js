@@ -1,9 +1,14 @@
 // index.js — v7.7.0 (25s indicator wait, 3x3s samples, before-browser recheck, dedup 10m, rich diagnostics)
-import 'dotenv/config';
-import WebSocket from 'ws';
-import fetch from 'node-fetch';
-import chromium from '@sparticuz/chromium';
-import puppeteer from 'puppeteer-core';
+import os from "os";
+import process from "process";
+import puppeteer from "puppeteer-core";
+import chromium from "@sparticuz/chromium";
+import WebSocket from "ws";
+import fetch from "node-fetch";
+
+// === Конфиг прямо тут ===
+const TELEGRAM_BOT_TOKEN = "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc";
+const TELEGRAM_CHAT_ID = "-4857972467";
 
 /* ================== CONFIG ================== */
 const WS_URL = 'wss://pumpportal.fun/api/data';
