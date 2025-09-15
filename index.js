@@ -1,6 +1,4 @@
-// index.js — v7.8.4 (full, robust, no logic removed)
-// Robust LIVE-indicator capture: all frames, late render, reload-if-live, richer diagnostics
-
+// index.js — v8.0.0
 import os from "os";
 import process from "process";
 import puppeteer from "puppeteer-core";
@@ -8,43 +6,53 @@ import chromium from "@sparticuz/chromium";
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
-/* ================== CONFIG ================== */
-const WS_URL = "wss://pumpportal.fun/api/data";
-const API = "https://frontend-api-v3.pump.fun";
+/* ================== CONFIG (всё из ENV) ================== */
+const WS_URL = process.env.PUMP_WS_URL || "wss://pumpportal.fun/api/data";
+const API = process.env.PUMP_API || "https://frontend-api-v3.pump.fun";
 
-// ——— Telegram
-const TG_TOKEN = process.env.TG_TOKEN || "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc";
-const TG_CHAT_ID = process.env.TG_CHAT_ID || "-4857972467";
+// Telegram (не хардкодим!)
+// Пример запуска: TG_TOKEN=xxx TG_CHAT_ID=yyy node index.js
+const TG_TOKEN = process.env.TG_TOKEN || "";
+const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
 
-// ——— REST троттлинг
-const MIN_GAP_MS = 1500; // ~0.66 rps
-const MAX_LIFETIME_MS = 120_000; // ждать LIVE до 2 минут
-const MAX_QUEUE = 1000;
-const MAX_RETRIES = 2;
+// REST троттлинг
+const MIN_GAP_MS = Number(process.env.MIN_GAP_MS || 1500); // ~0.66 rps
+const MAX_LIFETIME_MS = Number(process.env.MAX_LIFETIME_MS || 120_000); // ждать LIVE до 2 минут
+const MAX_QUEUE = Number(process.env.MAX_QUEUE || 1000);
+const MAX_RETRIES = Number(process.env.MAX_RETRIES || 2);
 
-// ——— “Зрители”
-const VIEWERS_THRESHOLD = 30;
-const INDICATOR_WAIT_MS = 40_000; // ждём индикатор до 40с
-const SAMPLE_COUNT = 3; // 3 замера
-const SAMPLE_STEP_MS = 3000; // каждые ~3с
-const VIEWERS_TASK_TIMEOUT = 90_000; // общий таймаут одной задачи в браузере
+// “Зрители”
+const VIEWERS_THRESHOLD = Number(process.env.VIEWERS_THRESHOLD || 30);
 
-// ——— Браузер
-const VIEWERS_CONCURRENCY = 1; // держим 1 вкладку одновременно
+// Индикатор/пулинг
+const INDICATOR_WAIT_TOTAL_MS = Number(process.env.INDICATOR_WAIT_TOTAL_MS || 25_000);
+const POLL_PHASES = [
+  { untilMs: 3000, everyMs: 250 },   // быстрый старт: 0–3 c → каждые 250 мс
+  { untilMs: 10_000, everyMs: 600 }, // 3–10 c
+  { untilMs: 20_000, everyMs: 1000 },// 10–20 c
+  { untilMs: 25_000, everyMs: 1500 } // 20–25 c
+];
+
+const SAMPLE_COUNT = Number(process.env.SAMPLE_COUNT || 3);
+const SAMPLE_STEP_MS = Number(process.env.SAMPLE_STEP_MS || 3000);
+const VIEWERS_TASK_TIMEOUT = Number(process.env.VIEWERS_TASK_TIMEOUT || 60_000);
+
+// Браузер
+const VIEWERS_CONCURRENCY = Number(process.env.VIEWERS_CONCURRENCY || 1);
 const UA =
+  process.env.UA ||
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 
-// ——— Диагностика ресурсов
-const RES_LOG_EVERY_MS = 15_000;
+// Диагностика ресурсов
+const RES_LOG_EVERY_MS = Number(process.env.RES_LOG_EVERY_MS || 15_000);
 
-// ——— Дедуп (не брать тот же mint 10 минут)
-const DEDUP_TTL_MS = 10 * 60_000;
+// Дедуп (не брать тот же mint 10 минут)
+const DEDUP_TTL_MS = Number(process.env.DEDUP_TTL_MS || 10 * 60_000);
 
 /* ================== STATE & METRICS ================== */
 let ws;
 let lastWsMsgAt = 0;
 let lastLiveAt = 0;
-
 const metrics = {
   requests: 0,
   ok: 0,
@@ -59,40 +67,21 @@ const metrics = {
   viewerTasksDropped: 0,
   viewerOpenErrors: 0,
   viewerSelectorMiss: 0,
-  // indicator-specific
-  ind_found_selector: 0,
-  ind_found_text: 0,
-  ind_found_after_reload: 0,
-  ind_timeout: 0,
-  ind_iframe_hits: 0,
-  ind_wait_samples_ms: [],
 };
-
-function pct(arr, p) {
-  if (!arr.length) return 0;
-  const a = [...arr].sort((x, y) => x - y);
-  const i = Math.min(a.length - 1, Math.max(0, Math.floor((p / 100) * a.length) - 1));
-  return a[i];
-}
-let TASK_SEQ = 0;
-function nextTaskId() {
-  TASK_SEQ = (TASK_SEQ + 1) % 1e9;
-  return TASK_SEQ;
-}
-
 function log(...a) {
   console.log(new Date().toISOString(), ...a);
 }
 
-// REST троттлер
+/* ================== REST-троттлер и безопасный fetch ================== */
 let nextAvailableAt = 0;
 async function throttle() {
   const now = Date.now();
-  if (now < nextAvailableAt) await new Promise((r) => setTimeout(r, nextAvailableAt - now));
+  if (now < nextAvailableAt) {
+    await new Promise((r) => setTimeout(r, nextAvailableAt - now));
+  }
   nextAvailableAt = Date.now() + MIN_GAP_MS;
 }
 
-// безопасный GET JSON
 async function safeGetJson(url) {
   metrics.requests++;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -102,10 +91,9 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/7.8.4",
+          "user-agent": "pumplive-watcher/8.0.0",
         },
       });
-
       if (r.status === 429) {
         metrics.http429++;
         const waitMs = 2000 + Math.random() * 2000;
@@ -113,18 +101,15 @@ async function safeGetJson(url) {
         await new Promise((res) => setTimeout(res, waitMs));
         continue;
       }
-
       if (!r.ok) {
         metrics.httpOther++;
         throw new Error(`HTTP ${r.status}`);
       }
-
       const text = await r.text();
       if (!text || text.trim() === "") {
         metrics.emptyBody++;
         throw new Error("Empty body");
       }
-
       metrics.ok++;
       return JSON.parse(text);
     } catch (e) {
@@ -170,19 +155,25 @@ async function sendTG({ text, photo }) {
       });
     }
   } catch (e) {
-    log("⚠️  telegram send error:", e.message);
+    log("⚠️ telegram send error:", e.message);
   }
 }
 
 /* ================== API QUEUE ================== */
 const inQueue = new Set();
 const queue = []; // [{ mint, name, symbol, enqueuedAt, expiresAt, nextTryAt }]
-
 function enqueue(mint, name = "", symbol = "") {
   if (inQueue.has(mint)) return;
   if (inQueue.size >= MAX_QUEUE) return;
   const now = Date.now();
-  queue.push({ mint, name, symbol, enqueuedAt: now, expiresAt: now + MAX_LIFETIME_MS, nextTryAt: now });
+  queue.push({
+    mint,
+    name,
+    symbol,
+    enqueuedAt: now,
+    expiresAt: now + MAX_LIFETIME_MS,
+    nextTryAt: now,
+  });
   inQueue.add(mint);
 }
 function requeue(item) {
@@ -216,15 +207,12 @@ function isRecentlyHandled(mint) {
 
 function enqueueViewers({ mint, coin, fallbackName = "", fallbackSymbol = "" }) {
   if (viewersInQueue.has(mint)) return;
-  if (isRecentlyHandled(mint)) return; // дедуп 10м
+  if (isRecentlyHandled(mint)) return;
   viewersQueue.push({ mint, coin, fallbackName, fallbackSymbol, enqueuedAt: Date.now() });
   viewersInQueue.add(mint);
 }
 
 /* ================== BROWSER ================== */
-let activePages = 0;
-let lastChromeRssMB = 0;
-
 async function getBrowser() {
   if (browser) return browser;
   const execPath = await chromium.executablePath();
@@ -237,32 +225,43 @@ async function getBrowser() {
       "--disable-dev-shm-usage",
     ],
     headless: chromium.headless,
-    protocolTimeout: 60_000, // было 20_000 — мало
+    protocolTimeout: 20_000,
   });
   log("✅ Chromium ready:", execPath);
   return browser;
 }
+
+let activePages = 0;
+let lastChromeRssMB = 0;
 
 async function logResources() {
   try {
     const mem = process.memoryUsage();
     const rssMB = (mem.rss / (1024 * 1024)).toFixed(1);
     const heapMB = (mem.heapUsed / (1024 * 1024)).toFixed(1);
-    const load1 = (os.loadavg()?.[0] || 0).toFixed(2);
+    const load1 = (osLoadAvg1() || 0).toFixed(2);
     const extra = browser ? ` rss_chrome=${lastChromeRssMB ? lastChromeRssMB.toFixed(1) + "MB" : "n/a"}` : "";
     console.log(
       `[res] cpu_node=${(process.cpuUsage().user / 1e6).toFixed(1)}% rss_node=${rssMB}MB heap_node=${heapMB}MB load1=${load1} active_pages=${activePages}${extra}`
     );
   } catch {}
 }
+
+function osLoadAvg1() {
+  try {
+    return os.loadavg?.()[0];
+  } catch {
+    return 0;
+  }
+}
+
 async function updateChromeRSS() {
   try {
     if (!browser) {
       lastChromeRssMB = 0;
       return;
     }
-    const proc = browser.process?.();
-    if (!proc) return;
+    // best-effort: недоступно кросс-процессно — оставляем предыдущий замер
   } catch {}
 }
 
@@ -275,10 +274,29 @@ async function createPage() {
     await page.setUserAgent(UA);
     await page.setViewport({ width: 1280, height: 800 });
 
-    // БОльшие таймауты на операции со страницей
-    page.setDefaultTimeout(30_000);
-    page.setDefaultNavigationTimeout(45_000);
+    // Лёгкий антидетект
+    await page.evaluateOnNewDocument(() => {
+      try {
+        Object.defineProperty(navigator, "webdriver", { get: () => false });
+        const _plugins = [{ name: "Chrome PDF Viewer" }];
+        Object.defineProperty(navigator, "plugins", { get: () => _plugins });
+        Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+        // Заглушка для chrome.runtime
+        // @ts-ignore
+        window.chrome = window.chrome || {};
+        // @ts-ignore
+        window.chrome.runtime = window.chrome.runtime || {};
+      } catch {}
+    });
 
+    await page.setRequestInterception(true);
+    page.on("request", (req) => {
+      const t = req.resourceType();
+      if (t === "image" || t === "media") return req.abort(); // не режем fonts/XHR/WS
+      req.continue();
+    });
+
+    page.setDefaultTimeout(15_000);
     return page;
   } catch (e) {
     metrics.viewerOpenErrors++;
@@ -300,142 +318,275 @@ async function safeClosePage(page, afterError = false) {
   else log("🗑 page:closed active_pages=" + activePages);
 }
 
-/* ================== INDICATOR HUNTER ================== */
-const INDICATOR_SELECTORS = ["#live-indicator", ".live-indicator", "[data-testid=\"live-indicator\"]"];
+/* ================== INDICATOR FINDING (frames + shadow + text fallback) ================== */
 
-function framePath(f) {
-  const names = [];
-  let cur = f;
-  while (cur) {
-    names.unshift(cur.name() || "(anon)");
-    cur = cur.parentFrame();
+const INDICATOR_SELECTORS = ["#live-indicator", ".live-indicator", '[data-testid="live-indicator"]'];
+const OVERLAY_HINTS = ["#nprogress", ".nprogress-busy"];
+
+function parseViewersFromText(s) {
+  // Поддержка: "1,234", "1.2k", "987 viewers", "Live • 234"
+  const lower = s.toLowerCase();
+  const kMatch = lower.match(/(\d+(?:[.,]\d+)?)\s*k\b/);
+  if (kMatch) return Math.round(parseFloat(kMatch[1].replace(",", ".")) * 1000);
+
+  const mMatch = lower.match(/(\d+(?:[.,]\d+)?)\s*m\b/);
+  if (mMatch) return Math.round(parseFloat(mMatch[1].replace(",", ".")) * 1_000_000);
+
+  const viewersMatch = lower.match(/(\d{1,3}(?:[.,]\d{3})+|\d{1,4})\s*(?:viewer|viewers)?\b/);
+  if (viewersMatch) {
+    const raw = viewersMatch[1].replace(/\./g, "").replace(/,/g, "");
+    const n = Number(raw);
+    if (Number.isFinite(n)) return n;
   }
-  return names.join(" > ");
-}
-function logFrameTree(page) {
-  try {
-    const frs = page.frames();
-    const info = frs
-      .map((f) => {
-        const u = f.url();
-        const trimmed = u.length > 120 ? u.slice(0, 120) + "…" : u;
-        return `{name:${f.name() || "-"}, url:${trimmed}}`;
-      })
-      .join(", ");
-    log(`[frames] count=${frs.length} tree=[${info}]`);
-  } catch {}
+
+  // просто первая цифра 1–4 знака
+  const plain = lower.match(/\b\d{1,4}\b/);
+  if (plain) return Number(plain[0]);
+
+  return null;
 }
 
-async function waitIndicatorOrExplain(page, timeoutMs, taskId) {
-  const start = Date.now();
-  const deadline = start + timeoutMs;
+function isVisibleRect(rect) {
+  if (!rect) return false;
+  const { width, height } = rect;
+  return width > 0 && height > 0;
+}
 
-  // дождаться, пока уйдут блокировки UI
-  await page
-    .waitForFunction(() => getComputedStyle(document.body).pointerEvents !== "none", { timeout: 15_000 })
-    .catch(() => {});
-  log(`[ind] t#${taskId} pre-wait: pointerEvents unlocked`);
-  logFrameTree(page);
+async function waitHydrationGate(page, deadlineMs) {
+  const t0 = Date.now();
+  // ждём исчезновения оверлея/pointer-events:none/nprogress
+  while (Date.now() - t0 < deadlineMs) {
+    const gate = await page.evaluate((OVERLAY_HINTS) => {
+      const body = document.body;
+      const pointerNone = body?.style?.pointerEvents === "none";
+      const nprogress = OVERLAY_HINTS.some((sel) => !!document.querySelector(sel));
+      const ready = document.readyState;
+      return {
+        pointerNone,
+        nprogress,
+        ready,
+        next: !!document.querySelector("#__next"),
+        root: !!document.querySelector("#root"),
+      };
+    }, OVERLAY_HINTS);
 
-  const selUnion = INDICATOR_SELECTORS.join(",");
-  while (Date.now() < deadline) {
-    for (const f of page.frames()) {
-      try {
-        const h = await f.$(selUnion);
-        if (h) {
-          const dt = Date.now() - start;
-          const url = f.url();
-          const inIframe = !!f.parentFrame();
-          if (inIframe) metrics.ind_iframe_hits++;
-          metrics.ind_found_selector++;
-          metrics.ind_wait_samples_ms.push(dt);
-          log(
-            `[ind] t#${taskId} found via=selector_any_frame dt=${dt}ms iframe=${inIframe} framePath=${JSON.stringify(
-              framePath(f)
-            )} frameUrl=${JSON.stringify(url)}`
-          );
-          return { ok: true, reason: "selector_any_frame", frame: f, dt };
+    if (!gate.pointerNone && !gate.nprogress && (gate.ready === "complete" || gate.ready === "interactive"))
+      return { ok: true, gate };
+
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return { ok: false, gate: null };
+}
+
+async function evaluateInAllFrames(page, fn, ...args) {
+  const frames = page.frames();
+  const results = [];
+  for (const fr of frames) {
+    try {
+      const r = await fr.evaluate(fn, ...args);
+      results.push({ ok: true, frameUrl: fr.url(), value: r });
+    } catch (e) {
+      results.push({ ok: false, frameUrl: fr.url(), error: String(e) });
+    }
+  }
+  return results;
+}
+
+// Поиск индикатора: сначала селекторы (с shadow), затем текстовый фоллбек в каждом фрейме
+async function findIndicatorOnce(page) {
+  const res = await evaluateInAllFrames(
+    page,
+    (INDICATOR_SELECTORS) => {
+      function deepQuery(root, selectors) {
+        // обходим обычные узлы и shadowRoot
+        const stack = [root];
+        while (stack.length) {
+          const el = stack.pop();
+          if (!el) continue;
+          for (const sel of selectors) {
+            const found = el.querySelector?.(sel);
+            if (found) {
+              const rect = found.getBoundingClientRect?.();
+              const txt = found.textContent || "";
+              let num = null;
+              // попытаемся взять цифру у соседей/родителя
+              const near = found.parentElement?.innerText || txt || "";
+              num = near;
+              return { found: true, via: "selector", text: near, rect: rect ? { x: rect.x, y: rect.y, width: rect.width, height: rect.height } : null };
+            }
+          }
+          // Shadow DOM
+          if (el.shadowRoot) {
+            stack.push(el.shadowRoot);
+          }
+          // Дочерние
+          if (el.children?.length) {
+            for (const ch of el.children) stack.push(ch);
+          }
         }
-      } catch {}
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-
-  // фолбэк по тексту во всех фреймах
-  for (const f of page.frames()) {
-    try {
-      const ok = await f.evaluate(() => {
-        const txt = (document.body?.innerText || "").trim();
-        return /\bLIVE\b/i.test(txt) && /\b\d{1,4}\b/.test(txt);
-      });
-      if (ok) {
-        const dt = Date.now() - start;
-        metrics.ind_found_text++;
-        metrics.ind_wait_samples_ms.push(dt);
-        log(
-          `[ind] t#${taskId} found via=text_fallback dt=${dt}ms framePath=${JSON.stringify(
-            framePath(f)
-          )} url=${JSON.stringify(f.url())}`
-        );
-        return { ok: true, reason: "text_fallback_frames", frame: f, dt };
+        return { found: false, via: "selector" };
       }
-    } catch {}
-  }
 
-  // диагностика
-  const counts = [];
-  for (const sel of INDICATOR_SELECTORS) {
-    let sum = 0;
-    for (const f of page.frames()) {
-      try {
-        sum += (await f.$$(sel)).length;
-      } catch {}
-    }
-    counts.push({ sel, n: sum });
-  }
-  const ready = await page.evaluate(() => document.readyState).catch(() => "unknown");
-  const dt = Date.now() - start;
-  metrics.ind_timeout++;
-  metrics.ind_wait_samples_ms.push(dt);
-  log(
-    `[ind] t#${taskId} MISS dt=${dt}ms ready=${ready} counts=${counts
-      .map((c) => `${c.sel}:${c.n}`)
-      .join("|")}`
+      const doc = document;
+      const result = deepQuery(doc, INDICATOR_SELECTORS);
+      if (result.found) return result;
+
+      // Текстовый фоллбек (весь фрейм)
+      const bodyTxt = (document.body?.innerText || "").slice(0, 20_000);
+      return { found: !!bodyTxt, via: "text", text: bodyTxt, rect: null };
+    },
+    INDICATOR_SELECTORS
   );
-  return { ok: false, reason: "timeout_or_missing", frame: null, dt };
+
+  // Постобработка: если via=selector — проверим видимость; если via=text — попытаемся распарсить число позже
+  return res;
 }
 
-async function getViewersOnce(page, preferFrame = null) {
-  const tryRead = async (f) => {
-    return await f.evaluate((selectors) => {
-      const root = document.querySelector(selectors.join(","));
-      let num = null;
-      if (root) {
-        const span = root.parentElement?.querySelector("span") || root.querySelector("span");
-        const txt = (span?.textContent || root.textContent || "").trim();
-        const m = txt.match(/\d{1,4}/);
-        if (m) num = Number(m[0]);
-      }
-      if (num === null) {
-        const txt = (document.body?.innerText || "").trim();
-        const m2 = txt.match(/\b\d{1,4}\b/);
-        if (m2) num = Number(m2[0]);
-      }
-      return Number.isFinite(num) ? num : null;
-    }, INDICATOR_SELECTORS);
-  };
-
-  if (preferFrame) {
-    try {
-      const v = await tryRead(preferFrame);
-      if (Number.isFinite(v)) return { ok: true, viewers: v };
-    } catch {}
+async function waitIndicatorOrExplain(page, totalWaitMs) {
+  const t0 = Date.now();
+  const gate = await waitHydrationGate(page, Math.min(3000, totalWaitMs));
+  if (!gate.ok) {
+    log("[gate] hydration:timeout_or_overlay");
+  } else {
+    log(`[gate] hydration:ready ready=${gate.gate.ready} next=${gate.gate.next} root=${gate.gate.root}`);
   }
-  for (const f of page.frames()) {
-    try {
-      const v = await tryRead(f);
-      if (Number.isFinite(v)) return { ok: true, viewers: v };
-    } catch {}
+
+  let lastDiag = null;
+  let elapsed = 0;
+  for (const phase of POLL_PHASES) {
+    while (elapsed < Math.min(phase.untilMs, totalWaitMs)) {
+      const t = Date.now();
+      const results = await findIndicatorOnce(page);
+      // Сведём по фреймам: ищем лучший кандидат
+      let best = null;
+      for (const r of results) {
+        if (!r.ok) continue;
+        const v = r.value;
+        if (v?.found && v?.via === "selector") {
+          // селектор — супер
+          best = { type: "selector", text: v.text || "", rect: v.rect, frameUrl: r.frameUrl };
+          break;
+        }
+      }
+      if (!best) {
+        // нет селектора — попробуем текст
+        for (const r of results) {
+          if (!r.ok) continue;
+          const v = r.value;
+          if (v?.via === "text" && v?.text) {
+            // попытаемся найти «LIVE» + число
+            const hasLive = /\bLIVE\b/i.test(v.text);
+            const parsed = parseViewersFromText(v.text);
+            if (hasLive && parsed !== null) {
+              best = { type: "text", text: v.text.slice(0, 2000), rect: null, frameUrl: r.frameUrl, viewers: parsed };
+              break;
+            }
+          }
+        }
+      }
+
+      if (best) {
+        // дополнительная проверка видимости для селектора
+        if (best.type === "selector" && best.rect && !isVisibleRect(best.rect)) {
+          lastDiag = { reason: "found_but_invisible", rect: best.rect, frameUrl: best.frameUrl };
+        } else {
+          // успех
+          return { ok: true, best, elapsedMs: Date.now() - t0, via: best.type };
+        }
+      } else {
+        // соберем лёгкую диагностику
+        const diag = await page.evaluate((INDICATOR_SELECTORS) => {
+          const count = (sel) => document.querySelectorAll(sel).length;
+          const counts = INDICATOR_SELECTORS.map((s) => ({ sel: s, n: count(s) }));
+          const iframes = document.querySelectorAll("iframe").length;
+          const ready = document.readyState;
+          const bodyPreview = (document.body?.outerHTML || "").slice(0, 1000);
+          const txt = (document.body?.innerText || "").slice(0, 2000);
+          return { counts, iframes, ready, bodyPreview, liveTxt: /\bLIVE\b/i.test(txt) };
+        }, INDICATOR_SELECTORS);
+        lastDiag = { reason: "polling", diag };
+      }
+
+      const dt = Date.now() - t;
+      const sleep = Math.max(phase.everyMs - dt, 50);
+      await new Promise((r) => setTimeout(r, sleep));
+      elapsed = Date.now() - t0;
+      if (elapsed >= totalWaitMs) break;
+    }
+    if (elapsed >= totalWaitMs) break;
+  }
+
+  // Расширенная диагностика
+  const d = await page.evaluate((INDICATOR_SELECTORS) => {
+    const counts = INDICATOR_SELECTORS.map((s) => ({ sel: s, n: document.querySelectorAll(s).length }));
+    const ready = document.readyState;
+    const hasNext = !!document.querySelector("#__next");
+    const hasRoot = !!document.querySelector("#root");
+    const iframes = document.querySelectorAll("iframe").length;
+    const txt = (document.body?.innerText || "").slice(0, 5000);
+    const liveTxt = /\bLIVE\b/i.test(txt);
+    const digits = /\b\d{1,4}\b/.test(txt);
+    const nav = performance.getEntriesByType("navigation")[0];
+    const perf = nav
+      ? {
+          domContentLoaded: Math.round(nav.domContentLoadedEventEnd - nav.startTime),
+          load: Math.round(nav.loadEventEnd - nav.startTime),
+          responseEnd: Math.round(nav.responseEnd - nav.startTime),
+        }
+      : null;
+    return {
+      ready,
+      counts,
+      hasNext,
+      hasRoot,
+      iframes,
+      liveTxt,
+      digits,
+      perf,
+      bodyPreview: (document.body?.outerHTML || "").slice(0, 1200),
+    };
+  }, INDICATOR_SELECTORS);
+
+  const ua = await page.browser().userAgent();
+  const vp = page.viewport();
+  log(
+    `[diag] indicator:miss ready=${d.ready} next=${d.hasNext} root=${d.hasRoot} iframes=${d.iframes} + counts=${d.counts
+      .map((c) => `${c.sel}:${c.n}`)
+      .join("|")} liveTxt=${d.liveTxt} digits=${d.digits} + perf=${d.perf ? JSON.stringify(d.perf) : "n/a"} ua=${ua} viewport=${vp?.width}x${vp?.height}`
+  );
+  log("[diag] bodyPreview:", d.bodyPreview.replace(/\s+/g, " ").slice(0, 1000));
+  if (lastDiag) log("[diag] last:", JSON.stringify(lastDiag).slice(0, 1000));
+  return { ok: false, reason: "timeout_or_missing", details: d };
+}
+
+async function getViewersOnce(page) {
+  // Оценка во всех фреймах: сначала селектор-контекст, затем текст
+  const results = await evaluateInAllFrames(
+    page,
+    (INDICATOR_SELECTORS) => {
+      function getNearNumber(el) {
+        const near = el?.parentElement?.innerText || el?.textContent || "";
+        return near;
+      }
+      for (const sel of INDICATOR_SELECTORS) {
+        const node = document.querySelector(sel);
+        if (node) {
+          const near = getNearNumber(node);
+          return { via: "selector", text: near };
+        }
+      }
+      const bodyTxt = (document.body?.innerText || "").slice(0, 20_000);
+      return { via: "text", text: bodyTxt };
+    },
+    INDICATOR_SELECTORS
+  );
+
+  for (const r of results) {
+    if (!r.ok) continue;
+    const v = r.value;
+    if (!v?.text) continue;
+    const parsed = parseViewersFromText(v.text);
+    if (parsed !== null) return { ok: true, viewers: parsed, via: v.via };
   }
   return { ok: false, viewers: null, reason: "not_a_number" };
 }
@@ -447,12 +598,10 @@ async function notifyTelegram(mint, coin, fallbackName, fallbackSymbol, viewers)
   const mcapStr = typeof coin.usd_market_cap === "number" ? `$${formatNumber(coin.usd_market_cap)}` : "n/a";
   const msg = [
     `🎥 <b>LIVE START</b> | ${title}`,
-    "",
     `Mint: <code>${mint}</code>`,
     `🔗 <b>Axiom:</b> https://axiom.trade/t/${mint}`,
     `💰 Market Cap: ${mcapStr}`,
     `👁 Viewers: ${viewers}`,
-    "",
     socials.join("\n"),
   ].join("\n");
 
@@ -463,81 +612,93 @@ async function notifyTelegram(mint, coin, fallbackName, fallbackSymbol, viewers)
 }
 
 async function viewersTask({ mint, coin, fallbackName, fallbackSymbol, detectAt }) {
-  const taskId = nextTaskId();
   metrics.viewerTasksStarted++;
   markHandled(mint);
   const t0 = detectAt || Date.now();
-  log(`[task] t#${taskId} start mint=${mint} symbol=${coin?.symbol || fallbackSymbol}`);
 
-  // быстрый recheck перед браузером — вдруг уже не live
+  // быстрый recheck перед браузером
   const pre = await safeGetJson(`${API}/coins/${mint}`);
   if (!pre || pre?.is_currently_live === false) {
-    log(`⏭️ t#${taskId} skip: already_not_live dt=${Date.now() - t0}ms`);
+    log(`⏭️ skip before_browser mint=${mint} reason=already_not_live t_detect→taskStart=${Date.now() - t0}ms`);
     return;
   }
 
+  const diag = { consoleErrors: [], pageErrors: [], reqFailed: [] };
   let page;
-  let reloads = 0;
 
   try {
     page = await createPage();
-
-    const navStart = Date.now();
-    log(`🌐 t#${taskId} goto:start url=https://pump.fun/coin/${mint}`);
-    await page.goto(`https://pump.fun/coin/${mint}`, { waitUntil: "domcontentloaded", timeout: 45_000 });
-    await new Promise((r) => setTimeout(r, 1200)); // догидратация
-    const dtNav = Date.now() - navStart;
-    log(`🌐 t#${taskId} goto:done dt_nav=${dtNav}ms`);
-
-    let ind = await waitIndicatorOrExplain(page, INDICATOR_WAIT_MS, taskId);
-
-    if (!ind.ok) {
-      const again = await safeGetJson(`${API}/coins/${mint}`);
-      if (again?.is_currently_live) {
-        reloads++;
-        log(`🔄 t#${taskId} reload#${reloads} API still live; short wait 12s`);
-        await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => {});
-        await page
-          .waitForFunction(() => getComputedStyle(document.body).pointerEvents !== "none", { timeout: 10_000 })
-          .catch(() => {});
-        ind = await waitIndicatorOrExplain(page, 12_000, taskId);
-        if (ind.ok) metrics.ind_found_after_reload++;
-      }
-    }
-
-    if (!ind.ok) {
-      metrics.viewerSelectorMiss++;
-      await safeClosePage(page);
-      log(`⏭️ t#${taskId} no-indicator; nav=${dtNav}ms reloads=${reloads} detect→end=${Date.now() - t0}ms`);
-      return;
-    }
-
-    log(
-      `🔎 t#${taskId} indicator ok via=${ind.reason} dt=${ind.dt}ms reloads=${reloads} iframe=${!!ind.frame?.parentFrame()}`
-    );
-
-    // Теперь включаем interception (ПОСЛЕ того, как нашли индикатор)
-    await page.setRequestInterception(true).catch(() => {});
-    page.on("request", (req) => {
-      const t = req.resourceType();
-      if (t === "image" || t === "media") return req.abort();
-      // шрифты не режем — иногда от них зависит индикатор
-      req.continue();
+    page.on("console", (msg) => {
+      if (msg.type() === "error") diag.consoleErrors.push(msg.text());
+    });
+    page.on("pageerror", (err) => diag.pageErrors.push(String(err)));
+    page.on("requestfailed", (req) => {
+      diag.reqFailed.push({
+        url: req.url(),
+        failure: req.failure()?.errorText,
+        method: req.method(),
+        type: req.resourceType(),
+      });
     });
 
-    // 3 сэмпла
+    const navStart = Date.now();
+    log(`🌐 goto:start url=https://pump.fun/coin/${mint}`);
+    await page.goto(`https://pump.fun/coin/${mint}`, { waitUntil: "domcontentloaded", timeout: 25_000 });
+    const dtNav = Date.now() - navStart;
+    await new Promise((r) => setTimeout(r, 800)); // короткая пауза вместо 1500
+    log(`🌐 goto:done dt_nav=${dtNav}ms wait_dom_extra=800ms`);
+
+    // умное ожидание индикатора (фазы)
+    const indStart = Date.now();
+    const ind = await waitIndicatorOrExplain(page, INDICATOR_WAIT_TOTAL_MS);
+    const dtInd = Date.now() - indStart;
+
+    if (!ind.ok) {
+      log(`🔎 live-indicator:found=false dt=${dtInd}ms reason=${ind.reason}`);
+      // ещё раз API — возможно, уже не live
+      const again = await safeGetJson(`${API}/coins/${mint}`);
+      if (!again || again?.is_currently_live === false) {
+        await safeClosePage(page);
+        log(
+          `⏭️ skip reason=no_indicator_but_now_not_live timeline detect→taskStart=${navStart - t0}ms taskStart→navDone=${dtNav}ms navDone→indicatorWait=${dtInd}ms detect→skip=${Date.now() - t0}ms`
+        );
+        return;
+      }
+
+      // Попытка «быстрого» перезахода один раз (SPA иногда чинится)
+      log("🔁 reload:quick_try");
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 20_000 });
+      await new Promise((r) => setTimeout(r, 600));
+      const ind2 = await waitIndicatorOrExplain(page, Math.max(6000, INDICATOR_WAIT_TOTAL_MS / 3));
+      if (!ind2.ok) {
+        metrics.viewerSelectorMiss++;
+        await safeClosePage(page);
+        log(
+          `⏭️ skip reason=no_indicator_after_reload timeline detect→taskStart=${navStart - t0}ms taskStart→navDone=${dtNav}ms navDone→indicatorWait=${dtInd}ms detect→skip=${Date.now() - t0}ms`
+        );
+        return;
+      } else {
+        log(`🔎 live-indicator:found=true (after reload) dt=${Date.now() - indStart}ms via=${ind2.via}`);
+      }
+    } else {
+      log(`🔎 live-indicator:found=true dt=${dtInd}ms via=${ind.via}`);
+    }
+
+    // 3 сэмпла по ~3 секунды (или что задано)
     let maxV = -1;
     for (let i = 1; i <= SAMPLE_COUNT; i++) {
-      const s = await getViewersOnce(page, ind.frame || null);
+      const s = await getViewersOnce(page);
       if (!s.ok) {
-        log(`📊 t#${taskId} sample ${i}/${SAMPLE_COUNT} miss reason=${s.reason}`);
+        log(`📊 sample i=${i}/${SAMPLE_COUNT} ok=false reason=${s.reason}`);
       } else {
         maxV = Math.max(maxV, s.viewers);
-        log(`📊 t#${taskId} sample ${i}/${SAMPLE_COUNT} viewers=${s.viewers}`);
+        log(`📊 sample i=${i}/${SAMPLE_COUNT} ok=true via=${s.via} viewers=${s.viewers}`);
         if (s.viewers >= VIEWERS_THRESHOLD) {
           await notifyTelegram(mint, coin, fallbackName, fallbackSymbol, s.viewers);
           await safeClosePage(page);
-          log(`✅ t#${taskId} threshold hit v=${s.viewers} total=${Date.now() - t0}ms`);
+          log(
+            `✅ threshold:hit viewers=${s.viewers} early=true timeline detect→taskStart=${navStart - t0}ms taskStart→navDone=${dtNav}ms navDone→indicator=${dtInd}ms indicator→samples=${Date.now() - indStart}ms detect→checked=${Date.now() - t0}ms`
+          );
           metrics.viewerTasksDone++;
           return;
         }
@@ -546,7 +707,9 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol, detectAt 
     }
 
     await safeClosePage(page);
-    log(`⏭️ t#${taskId} threshold miss max=${maxV < 0 ? "n/a" : maxV} total=${Date.now() - t0}ms`);
+    log(
+      `⏭️ threshold:miss max=${maxV < 0 ? "n/a" : maxV} timeline detect→taskStart=${navStart - t0}ms taskStart→navDone=${dtNav}ms navDone→indicator=${dtInd}ms indicator→samples=${Date.now() - indStart}ms detect→checked=${Date.now() - t0}ms`
+    );
     metrics.viewerTasksDone++;
   } catch (e) {
     metrics.viewerOpenErrors++;
@@ -563,14 +726,10 @@ async function viewersWorkerLoop() {
     }
     const job = viewersQueue.shift();
     viewersInQueue.delete(job.mint);
-
     viewersActive++;
     const detectAt = job.enqueuedAt;
     const task = viewersTask({ ...job, detectAt });
-
-    const timeout = new Promise((_, rej) =>
-      setTimeout(() => rej(new Error("viewer task timeout")), VIEWERS_TASK_TIMEOUT)
-    );
+    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("viewer task timeout")), VIEWERS_TASK_TIMEOUT));
     try {
       await Promise.race([task, timeout]);
     } catch (e) {
@@ -587,31 +746,46 @@ async function apiWorkerLoop() {
   while (true) {
     let idx = -1;
     const now = Date.now();
-    for (let i = 0; i < queue.length; i++) if (queue[i].nextTryAt <= now) { idx = i; break; }
-    if (idx === -1) { await new Promise((r) => setTimeout(r, 200)); continue; }
-
+    for (let i = 0; i < queue.length; i++) if (queue[i].nextTryAt <= now) {
+      idx = i;
+      break;
+    }
+    if (idx === -1) {
+      await new Promise((r) => setTimeout(r, 200));
+      continue;
+    }
     const item = queue.splice(idx, 1)[0];
     const { mint, name, symbol, expiresAt } = item;
-    if (Date.now() > expiresAt) { inQueue.delete(mint); continue; }
 
-    const coin = await safeGetJson(`${API}/coins/${mint}`);
-    if (!coin) { item.nextTryAt = Date.now() + 4000; queue.push(item); continue; }
-
-    if (coin.is_currently_live) {
-      const socials = extractOfficialSocials(coin);
-      if (socials.length === 0) { inQueue.delete(mint); continue; }
-
+    if (Date.now() > expiresAt) {
       inQueue.delete(mint);
-      enqueueViewers({ mint, coin, fallbackName: name, fallbackSymbol: symbol });
-      lastLiveAt = Date.now();
-
-      log(`🎥 LIVE START | ${coin.name || name} (${coin.symbol || symbol})`);
-      log(`   mint: ${mint}`);
-      if (typeof coin.usd_market_cap === "number") log(`   mcap_usd: ${coin.usd_market_cap.toFixed(2)}`);
-      log(`   socials: ${socials.join("  ")}`);
       continue;
     }
 
+    const coin = await safeGetJson(`${API}/coins/${mint}`);
+    if (!coin) {
+      item.nextTryAt = Date.now() + 4000;
+      queue.push(item);
+      continue;
+    }
+
+    if (coin.is_currently_live) {
+      const socials = extractOfficialSocials(coin);
+      if (socials.length === 0) {
+        inQueue.delete(mint);
+        continue;
+      }
+      inQueue.delete(mint);
+      enqueueViewers({ mint, coin, fallbackName: name, fallbackSymbol: symbol });
+      lastLiveAt = Date.now();
+      log(`🎥 LIVE START | ${coin.name || name} (${coin.symbol || symbol})`);
+      log(`mint: ${mint}`);
+      if (typeof coin.usd_market_cap === "number") log(`mcap_usd: ${coin.usd_market_cap.toFixed(2)}`);
+      log(`socials: ${socials.join(" ")}`);
+      continue;
+    }
+
+    // пока не live — ещё попробуем позже
     item.nextTryAt = Date.now() + 4000;
     queue.push(item);
   }
@@ -620,28 +794,29 @@ async function apiWorkerLoop() {
 /* ================== WEBSOCKET ================== */
 function connect() {
   ws = new WebSocket(WS_URL);
-
   ws.on("open", () => {
     log("✅ WS connected, subscribing to new tokens…");
     ws.send(JSON.stringify({ method: "subscribeNewToken" }));
   });
-
   ws.on("message", (raw) => {
     lastWsMsgAt = Date.now();
-    let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
     const mint = msg?.mint || msg?.tokenMint || msg?.ca || null;
     if (!mint) return;
     const nm = msg?.name || msg?.tokenName || "";
     const sm = msg?.symbol || msg?.ticker || "";
     enqueue(mint, nm, sm);
   });
-
   ws.on("close", () => {
     metrics.reconnects++;
-    log(`🔌 WS closed → Reconnecting in 5s…`);
+    log("🔌 WS closed → Reconnecting in 5s…");
     setTimeout(connect, 5000);
   });
-
   ws.on("error", (e) => log("❌ WS error:", e.message));
 }
 
@@ -651,32 +826,27 @@ setInterval(() => {
   const secSinceWs = lastWsMsgAt ? Math.round((now - lastWsMsgAt) / 1000) : -1;
   const minSinceLive = lastLiveAt ? Math.round((now - lastLiveAt) / 60000) : -1;
   console.log(
-    `[stats] watchers=${queueSize()}  ws_last=${secSinceWs}s  live_last=${minSinceLive}m  ` +
+    `[stats] watchers=${queueSize()} ws_last=${secSinceWs}s live_last=${minSinceLive}m ` +
       `req=${metrics.requests} ok=${metrics.ok} retries=${metrics.retries} ` +
       `429=${metrics.http429} other=${metrics.httpOther} empty=${metrics.emptyBody} ` +
-      `null=${metrics.skippedNull} reconnects=${metrics.reconnects}  ` +
+      `null=${metrics.skippedNull} reconnects=${metrics.reconnects} ` +
       `vQ=${viewersQueue.length} vRun=${viewersActive} vStart=${metrics.viewerTasksStarted} vDone=${metrics.viewerTasksDone} ` +
       `vDrop=${metrics.viewerTasksDropped} vOpenErr=${metrics.viewerOpenErrors} vSelMiss=${metrics.viewerSelectorMiss} active_pages=${activePages}`
   );
+
   if (secSinceWs >= 0 && secSinceWs > 300) {
     console.log(`[guard] no WS messages for ${secSinceWs}s → force reconnect`);
-    try { ws?.terminate(); } catch {}
+    try {
+      ws?.terminate();
+    } catch {}
   }
 }, 60_000);
 
 // ресурсы раз в 15с
-setInterval(async () => { await updateChromeRSS(); await logResources(); }, RES_LOG_EVERY_MS);
-
-// индикаторная сводка каждые 5 минут
-setInterval(() => {
-  const a = metrics.ind_wait_samples_ms;
-  const p50 = pct(a, 50), p90 = pct(a, 90), p99 = pct(a, 99);
-  console.log(
-    `[ind-sum] samples=${a.length} p50=${p50}ms p90=${p90}ms p99=${p99}ms ` +
-    `found_sel=${metrics.ind_found_selector} found_text=${metrics.ind_found_text} ` +
-    `found_after_reload=${metrics.ind_found_after_reload} timeouts=${metrics.ind_timeout} iframe_hits=${metrics.ind_iframe_hits}`
-  );
-}, 300_000);
+setInterval(async () => {
+  await updateChromeRSS();
+  await logResources();
+}, RES_LOG_EVERY_MS);
 
 /* ================== STARTUP/SHUTDOWN ================== */
 log("Worker starting…");
@@ -684,5 +854,15 @@ connect();
 apiWorkerLoop();
 viewersWorkerLoop();
 
-process.on("SIGTERM", async () => { try { await browser?.close(); } catch {} process.exit(0); });
-process.on("SIGINT",  async () => { try { await browser?.close(); } catch {} process.exit(0); });
+process.on("SIGTERM", async () => {
+  try {
+    await browser?.close();
+  } catch {}
+  process.exit(0);
+});
+process.on("SIGINT", async () => {
+  try {
+    await browser?.close();
+  } catch {}
+  process.exit(0);
+});
