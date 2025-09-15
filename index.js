@@ -1,4 +1,4 @@
-// index.js — v7.1.0 (single page reuse, 30s selector wait, smart viewers finder, DOM diagnostics)
+// index.js — v7.2.0 (new page per token, close after use)
 import WebSocket from "ws";
 import fetch from "node-fetch";
 import chromium from "@sparticuz/chromium";
@@ -60,7 +60,7 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/7.1.0"
+          "user-agent": "pumplive-watcher/7.2.0"
         }
       });
 
@@ -182,7 +182,6 @@ async function apiWorkerLoop() {
 const viewersQueue = [];
 const viewersInQueue = new Set();
 let browser = null;
-let page = null;
 let viewersActive = 0;
 
 function enqueueViewers({ mint, coin, fallbackName = "", fallbackSymbol = "" }) {
@@ -211,47 +210,18 @@ async function getBrowser() {
   return browser;
 }
 
-async function getPage() {
-  const t = makeTimer();
-  const br = await getBrowser();
-  let reused = false;
-  try {
-    if (page && !page.isClosed()) {
-      try { await page.title(); reused = true; }
-      catch { page = null; reused = false; }
-    }
-    if (!page || page.isClosed()) {
-      page = await br.newPage();
-      await page.setUserAgent(UA);
-      await page.setViewport({ width: 1280, height: 800 });
-      page.setDefaultTimeout(60_000);
-      page.setDefaultNavigationTimeout(60_000);
-    }
-    log(`🧊 chrome:warmup ok=true reused=${reused} dt=${t()}ms`);
-    return page;
-  } catch (e) {
-    metrics.viewerOpenErrors++;
-    log(`❌ page:new error=${e.message} dt=${t()}ms`);
-    try { await browser?.close(); } catch {}
-    browser = null; page = null;
-    throw e;
-  }
-}
-
-// ——— “умный” поиск числа зрителей с фолбэками
+// ——— поиск числа зрителей
 async function findViewersNumber(pg) {
   return await pg.evaluate(() => {
     const pickNumber = (txt) => {
       const m = (txt || "").match(/\d{1,6}/);
       return m ? Number(m[0]) : null;
     };
-
     const roots = [
       document.querySelector('#live-indicator'),
       document.querySelector('[data-testid*="live" i]'),
       document.querySelector('[class*="live"][class*="indicator"]'),
-      Array.from(document.querySelectorAll('span,div,b,strong'))
-        .find(n => /live/i.test(n.textContent || '')) || null,
+      Array.from(document.querySelectorAll('span,div,b,strong')).find(n => /live/i.test(n.textContent || '')) || null,
     ].filter(Boolean);
 
     for (const root of roots) {
@@ -259,16 +229,15 @@ async function findViewersNumber(pg) {
                  root.parentElement?.querySelector('span') ||
                  root.closest('div')?.querySelector('span');
       const n = span ? pickNumber(span.textContent) : null;
-      if (Number.isFinite(n)) return { ok: true, viewers: n, via: 'fallback' };
+      if (Number.isFinite(n)) return { ok: true, viewers: n };
     }
 
-    // Последняя попытка: глобальный поиск “Live” + число в одном блоке
     const blocks = Array.from(document.querySelectorAll('div,section,header'));
     for (const el of blocks) {
       const t = (el.textContent || '').trim();
       if (/live/i.test(t)) {
         const n = pickNumber(t);
-        if (Number.isFinite(n)) return { ok: true, viewers: n, via: 'global' };
+        if (Number.isFinite(n)) return { ok: true, viewers: n };
       }
     }
     return { ok: false, reason: 'no_live_indicator' };
@@ -288,93 +257,58 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
 
   let pg;
   try {
-    // 1) вкладка
-    pg = await getPage();
+    const br = await getBrowser();
+    pg = await br.newPage();
+    await pg.setUserAgent(UA);
+    await pg.setViewport({ width: 1280, height: 800 });
+    pg.setDefaultTimeout(60_000);
+    pg.setDefaultNavigationTimeout(60_000);
 
-    // 2) навигация
     const tNav = makeTimer();
     const url = `https://pump.fun/coin/${mint}`;
     log(`🌐 goto:start url=${url}`);
-    try {
-      await pg.goto(url, { waitUntil: "domcontentloaded" });
-      const extraWait = 1500;
-      await sleep(extraWait);
-      log(`🌐 goto:done dt_nav=${tNav()}ms wait_dom_extra=${extraWait}ms`);
-    } catch (e) {
-      log(`🌐 goto:error kind=${/timeout/i.test(e.message) ? "timeout" : "other"} dt=${tNav()}ms msg="${e.message}"`);
-      await sleep(1000);
-      const tNav2 = makeTimer();
-      try {
-        await pg.goto(url, { waitUntil: "domcontentloaded" });
-        const extraWait = 1500;
-        await sleep(extraWait);
-        log(`🌐 goto:retry_success dt_nav=${tNav2()}ms wait_dom_extra=${extraWait}ms`);
-      } catch (e2) {
-        metrics.viewerTasksDropped++;
-        log(`❌ goto:failed_twice dt1=${tNav()}ms dt2=${tNav2()}ms msg2="${e2.message}"`);
-        return;
-      }
-    }
+    await pg.goto(url, { waitUntil: "domcontentloaded" });
+    await sleep(1500);
+    log(`🌐 goto:done dt_nav=${tNav()}ms wait_dom_extra=1500ms`);
 
-    // 3) ждём индикатор не дольше 30с (если появится раньше — идём дальше сразу)
+    // ждём индикатор не дольше 30с
     const tSel = makeTimer();
-    let selectorFound = true;
     try {
       await pg.waitForSelector("#live-indicator", { timeout: 30_000 });
       log(`🔎 live-indicator:found=true dt=${tSel()}ms`);
     } catch {
-      selectorFound = false;
       metrics.viewerSelectorMiss++;
       log(`🔎 live-indicator:found=false dt=${tSel()}ms reason=timeout_or_missing`);
     }
 
-    // 4) 30с измерений (6×)
     let maxV = -1;
-    let consecutiveMiss = 0;
     for (let i = 0; i < SAMPLE_ITER; i++) {
       const tSample = makeTimer();
-      let res;
-      try { res = await checkViewersOnce(pg); }
-      catch (e) {
-        log(`📊 sample i=${i + 1}/${SAMPLE_ITER} error="${e.message}" dt=${tSample()}ms`);
-        if (i < SAMPLE_ITER - 1) await sleep(SAMPLE_STEP_MS);
-        continue;
-      }
-
+      const res = await checkViewersOnce(pg);
       if (!res.ok) {
-        consecutiveMiss++;
         log(`📊 sample i=${i + 1}/${SAMPLE_ITER} ok=false reason=${res.reason} dt=${tSample()}ms`);
-
-        // Диагностика DOM при повторных промахах (на 2-м и 3-м тиках)
-        if (consecutiveMiss === 2 || consecutiveMiss === 3) {
-          try {
-            const dump = await pg.evaluate(() => {
-              const text = (document.body?.innerText || "").slice(0, 2000).replace(/\s+/g, " ");
-              return { hasLive: /live/i.test(text), head: text };
-            });
-            console.log(`${new Date().toISOString()} 🧪 dom: hasLive=${dump.hasLive} head="${dump.head}"`);
-          } catch {}
-        }
       } else {
-        consecutiveMiss = 0;
         maxV = Math.max(maxV, res.viewers);
         log(`📊 sample i=${i + 1}/${SAMPLE_ITER} ok=true viewers=${res.viewers} dt=${tSample()}ms`);
         if (res.viewers >= VIEWERS_THRESHOLD) {
           await notifyTelegram(mint, coin, fallbackName, fallbackSymbol, res.viewers, jobTimer());
           metrics.viewerTasksDone++;
+          await pg.close();
+          log("🗑 page:closed");
           return;
         }
       }
-
       if (i < SAMPLE_ITER - 1) await sleep(SAMPLE_STEP_MS);
     }
 
-    // 5) не дотянули
     log(`⏭️ threshold:miss max=${maxV < 0 ? "n/a" : maxV} t_window=30s t_total=${jobTimer()}ms`);
     metrics.viewerTasksDone++;
+    await pg.close();
+    log("🗑 page:closed");
   } catch (e) {
     metrics.viewerOpenErrors++;
     log(`⚠️ viewers task error: ${e.message}`);
+    try { await pg?.close(); log("🗑 page:closed after error"); } catch {}
   }
 }
 
