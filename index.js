@@ -1,6 +1,5 @@
 // index.js
 import WebSocket from "ws";
-// fetch встроен в Node.js v18+ — импорт не нужен
 
 // ============================
 // Конфиг
@@ -55,7 +54,6 @@ async function confirmLive(mint) {
   );
   await sleep(debounce);
 
-  let lastErr = null;
   for (let i = 0; i <= QUICK_RECHECKS; i++) {
     try {
       const c = await fetchCoinSafe(mint, 2);
@@ -72,13 +70,11 @@ async function confirmLive(mint) {
         return;
       }
 
-      // если не лайв — повторим через QUICK_STEP_MS
       if (i < QUICK_RECHECKS) {
         await sleep(QUICK_STEP_MS);
         continue;
       }
 
-      // последняя попытка и всё ещё false
       console.log(new Date().toISOString(),
         `… not live | ${mint} | viewers=${viewers} | is_currently_live=false`
       );
@@ -86,7 +82,6 @@ async function confirmLive(mint) {
       return;
 
     } catch (e) {
-      lastErr = e;
       if (i < QUICK_RECHECKS) {
         await sleep(QUICK_STEP_MS);
         continue;
