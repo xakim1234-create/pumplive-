@@ -1,11 +1,14 @@
 {
-  "name": "pump-watcher",
-  "version": "10.4.1",
+  "name": "pumplive",
+  "version": "1.0.0",
   "type": "module",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
+  "scripts": {
+    "start": "node index.js",
+    "live": "node index.js"
+  },
   "dependencies": {
-    "node-fetch": "^3.3.2",
+    "undici": "^6.19.8",
     "ws": "^8.18.0"
   }
 }
