@@ -1,15 +1,15 @@
 {
   "name": "pump-watcher",
-  "version": "6.0.1",
+  "version": "6.1.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "postinstall": "npx puppeteer browsers install chrome",
     "start": "node index.js"
   },
   "dependencies": {
+    "@sparticuz/chromium": "^126.0.0",
     "node-fetch": "^3.3.2",
-    "puppeteer": "^22.15.0",
+    "puppeteer-core": "^22.15.0",
     "ws": "^8.18.0"
   }
 }
