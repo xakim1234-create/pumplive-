@@ -1,8 +1,9 @@
-// index.js — v10.0.0 ("single 5s check" design)
-// Логика: WS даёт mint → ЖДЁМ РОВНО 5s → один API-чек.
-//  - Если live → запускаем измерение окна до 30s (до 6 проб каждые ~5s) и, если порог взят, шлём TG-алёрт.
-//  - Если not_live → мгновенный skip. НИКАКИХ повторных recheck и очередей recheck.
-//  - Весь трафик API идёт через ОДИН глобальный лимитер RPS, чтобы не ловить 429. Воркеров может быть много.
+// index.js — v10.1.0 ("5s first check" + optional "10s second check")
+// Логика:
+//  - WS даёт mint в T0 → НЕ дергаем API сразу.
+//  - Планируем ПЕРВЫЙ чек на T0+5s. Если live → запускаем 30s окно; если not_live → планируем ВТОРОЙ чек на T0+10s.
+//  - На T0+10s (если был not_live) делаем ОДИН дополнительный чек: live → 30s окно; иначе окончательный skip.
+//  - Больше recheck НЕТ. Очередей нет: отложенные задачи просто ждут своего времени. Все API-вызовы через единый RPS-лимитер.
 // Браузер НЕ используется.
 
 // ===== Imports =====
@@ -20,8 +21,9 @@ const MEASURE_WINDOW_MS   = int("MEASURE_WINDOW_MS", 30_000);    // 30s окно
 const RECHECKS            = int("RECHECKS", 6);                   // 6 проб
 const RECHECK_STEP_MS     = int("RECHECK_STEP_MS", 5_000);        // шаг 5s
 
-// Единственный 5-секундный задержанный первичный чек
-const FIRST_CHECK_DELAY_MS = int("FIRST_CHECK_DELAY_MS", 5_000);  // Ждём 5s после WS
+// Отложенные проверки
+const FIRST_CHECK_DELAY_MS  = int("FIRST_CHECK_DELAY_MS", 5_000);   // T0+5s
+const SECOND_CHECK_DELAY_MS = int("SECOND_CHECK_DELAY_MS", 10_000);  // T0+10s (создаём только если первый not_live)
 
 // Параллельность и глобальный троттлинг API
 const MAX_CONCURRENCY     = int("MAX_CONCURRENCY", 8);            // воркеры на выполнение готовых задач
@@ -32,7 +34,7 @@ const JITTER_MS           = int("JITTER_MS", 150);                 // небол
 const DEDUP_TTL_MS        = int("DEDUP_TTL_MS", 10 * 60_000);
 
 // Поведение (для логов)
-const STRICT_ONE_SHOT     = bool("STRICT_ONE_SHOT", true);         // теперь реально one-shot на T0+5s
+const STRICT_ONE_SHOT     = bool("STRICT_ONE_SHOT", true);         // фактически 1–2 попытки (5s и опционально 10s)
 const API_VIEWERS_ONLY    = bool("API_VIEWERS_ONLY", true);
 
 // Rescue для api_null
@@ -61,10 +63,15 @@ let lastWsMsgAt = 0;
 
 const metrics = {
   api_req: 0, api_ok: 0, api_retry: 0, api_429: 0, api_other: 0,
-  queued: 0, scheduled: 0, started: 0, done: 0, alerted: 0,
+  queued: 0, started: 0, done: 0, alerted: 0,
   dedup_skip: 0, api_null_skip: 0, threshold_miss: 0, not_live_skip: 0,
   api_null_recovered: 0,
-  schedule_ready_delay_ms_sum: 0, schedule_ready_count: 0,
+  // Планирование
+  scheduled_first: 0, scheduled_second: 0,
+  performed_first: 0, performed_second: 0,
+  second_live: 0, second_skip: 0,
+  avgReadyDelayFirstMs_sum: 0, avgReadyDelayFirstMs_cnt: 0,
+  avgReadyDelaySecondMs_sum: 0, avgReadyDelaySecondMs_cnt: 0,
 };
 
 // дедуп по mint (для входа из WS)
@@ -108,7 +115,7 @@ async function fetchCoin(mint, maxRetries=2){
           "accept": "application/json, text/plain, */*",
           "cache-control": "no-cache, no-store",
           "pragma": "no-cache",
-          "user-agent": "pump-watcher/10.0.0"
+          "user-agent": "pump-watcher/10.1.0"
         }
       });
       if (r.status === 429){
@@ -171,8 +178,10 @@ async function alertLive(mint, coin, viewers, source="api"){
     `👁 Viewers: ${fmt(viewers)} (source: ${source})`,
     `💰 Market Cap (USD): ${typeof coin.usd_market_cap==="number" ? "$"+fmt(coin.usd_market_cap) : "n/a"}`,
     `🔗 Axiom: https://axiom.trade/t/${mint}`,
-    socials.length ? socials.join("\n") : null
-  ].filter(Boolean).join("\n");
+    socials.length ? socials.join("
+") : null
+  ].filter(Boolean).join("
+");
 
   log("tg:send start");
   await sendTG(msg, coin?.image_uri || null);
@@ -206,23 +215,40 @@ async function measureWindow(mint){
   return { ok:false, reason:"threshold_not_reached", maxViewers };
 }
 
-// ===== Планировщик «одного чека через 5s» + воркеры =====
-const delayedChecks = [];          // элементы: { mint, at }
-const scheduledSet = new Set();    // чтобы не планировать дубли в окно 5s
+// ===== Планировщик: first@5s и (опционально) second@10s =====
+const delayedFirst = [];           // элементы: { mint, at, t0 }
+const delayedSecond = [];          // элементы: { mint, at, t0 }
+const scheduledFirstSet = new Set();
+const scheduledSecondSet = new Set();
 let activeWorkers = 0;
 
-function scheduleSingleCheck(mint){
-  if (scheduledSet.has(mint)) return; // уже запланирован
-  scheduledSet.add(mint);
-  delayedChecks.push({ mint, at: Date.now() + FIRST_CHECK_DELAY_MS });
-  metrics.scheduled++;
+function scheduleFirst(mint){
+  if (scheduledFirstSet.has(mint)) return; // уже запланирован первый
+  const t0 = Date.now();
+  scheduledFirstSet.add(mint);
+  delayedFirst.push({ mint, at: t0 + FIRST_CHECK_DELAY_MS, t0 });
+  metrics.scheduled_first++;
+}
+
+function scheduleSecond(mint, t0){
+  if (scheduledSecondSet.has(mint)) return; // не дублируем второй
+  scheduledSecondSet.add(mint);
+  const at = Math.max(Date.now(), t0 + SECOND_CHECK_DELAY_MS); // если 10с уже прошли — выполняем как можно скорее
+  delayedSecond.push({ mint, at, t0 });
+  metrics.scheduled_second++;
 }
 
 function takeReadyJob(){
   const now = Date.now();
-  for (let i=0; i<delayedChecks.length; i++){
-    if ((delayedChecks[i].at || 0) <= now){
-      return delayedChecks.splice(i,1)[0];
+  // Приоритет вторых проверок
+  for (let i=0; i<delayedSecond.length; i++){
+    if ((delayedSecond[i].at || 0) <= now){
+      return { ...delayedSecond.splice(i,1)[0], kind: 'second' };
+    }
+  }
+  for (let i=0; i<delayedFirst.length; i++){
+    if ((delayedFirst[i].at || 0) <= now){
+      return { ...delayedFirst.splice(i,1)[0], kind: 'first' };
     }
   }
   return null;
@@ -236,16 +262,24 @@ async function workerLoop(){
 
     activeWorkers++;
     (async () => {
-      const startedAt = Date.now();
       try{
         metrics.started++;
-        const { mint, at } = job;
-        scheduledSet.delete(mint);
-        const readyDelay = Math.max(0, startedAt - at);
-        metrics.schedule_ready_delay_ms_sum += readyDelay;
-        metrics.schedule_ready_count++;
+        const startAt = Date.now();
+        const { mint, at, t0, kind } = job;
+        if (kind === 'first') scheduledFirstSet.delete(mint); else scheduledSecondSet.delete(mint);
 
-        // === Единственный первичный чек: ===
+        // метрика готовности
+        if (kind === 'first'){
+          metrics.performed_first++;
+          metrics.avgReadyDelayFirstMs_sum += Math.max(0, startAt - at);
+          metrics.avgReadyDelayFirstMs_cnt++;
+        } else {
+          metrics.performed_second++;
+          metrics.avgReadyDelaySecondMs_sum += Math.max(0, startAt - at);
+          metrics.avgReadyDelaySecondMs_cnt++;
+        }
+
+        // === Чек ===
         let coin = await fetchCoin(mint, 2);
         if (!coin){
           for (let i=1; i<=API_NULL_RETRIES; i++){
@@ -262,10 +296,18 @@ async function workerLoop(){
         }
 
         if (coin.is_currently_live !== true){
-          metrics.not_live_skip++;
-          log("skip: not_live (one-shot)", mint);
+          if (kind === 'first'){
+            // планируем второй на T0+10s
+            scheduleSecond(mint, t0);
+          } else {
+            metrics.second_skip++;
+            metrics.not_live_skip++;
+            log("skip: not_live (second one-shot)", mint);
+          }
           return;
         }
+
+        if (kind === 'second') metrics.second_live++;
 
         // === Live → измеряем окно ===
         const res = await measureWindow(mint);
@@ -300,9 +342,8 @@ function connectWS(){
     if (seenRecently(mint)){ metrics.dedup_skip++; return; }
     markSeen(mint);
 
-    // Запланировать единственный чек через 5s
     metrics.queued++;
-    scheduleSingleCheck(mint);
+    scheduleFirst(mint); // только первый чек; второй создастся автоматически при not_live
   });
   ws.on("close", () => { log("WS closed → reconnect in 5s"); setTimeout(connectWS, 5000); });
   ws.on("error", (e) => { log("WS error:", e.message); });
@@ -312,12 +353,14 @@ function connectWS(){
 setInterval(() => {
   const secSinceWs = lastWsMsgAt ? Math.round((Date.now()-lastWsMsgAt)/1000) : -1;
   const apiNullPct = metrics.api_req ? ((metrics.api_null_skip / Math.max(1, metrics.api_req)) * 100).toFixed(1) : "0.0";
-  const avgReadyDelay = metrics.schedule_ready_count ? Math.round(metrics.schedule_ready_delay_ms_sum / metrics.schedule_ready_count) : 0;
+  const avgFirst = metrics.avgReadyDelayFirstMs_cnt ? Math.round(metrics.avgReadyDelayFirstMs_sum / metrics.avgReadyDelayFirstMs_cnt) : 0;
+  const avgSecond = metrics.avgReadyDelaySecondMs_cnt ? Math.round(metrics.avgReadyDelaySecondMs_sum / metrics.avgReadyDelaySecondMs_cnt) : 0;
   log(
     "[stats]",
     "queued="+metrics.queued,
     "active="+activeWorkers,
-    "stack_delayed="+delayedChecks.length,
+    "stack_first="+delayedFirst.length,
+    "stack_second="+delayedSecond.length,
     "ws_last="+secSinceWs+"s",
     "| api:req="+metrics.api_req,
     "ok="+metrics.api_ok,
@@ -331,7 +374,14 @@ setInterval(() => {
     "api_null="+metrics.api_null_skip+`(${apiNullPct}%)`,
     "not_live="+metrics.not_live_skip,
     "miss="+metrics.threshold_miss,
-    "| avgReadyDelayMs="+avgReadyDelay
+    "| scheduled:first="+metrics.scheduled_first,
+    "second="+metrics.scheduled_second,
+    "performed:first="+metrics.performed_first,
+    "second="+metrics.performed_second,
+    "second_live="+metrics.second_live,
+    "second_skip="+metrics.second_skip,
+    "| avgReadyDelayFirstMs="+avgFirst,
+    "avgReadyDelaySecondMs="+avgSecond
   );
 }, HEARTBEAT_MS);
 
@@ -341,6 +391,7 @@ log("Worker starting…",
   "| WINDOW="+MEASURE_WINDOW_MS+"ms",
   "| RECHECKS="+RECHECKS+"@"+RECHECK_STEP_MS+"ms",
   "| FIRST_CHECK_DELAY="+FIRST_CHECK_DELAY_MS+"ms",
+  "| SECOND_CHECK_DELAY="+SECOND_CHECK_DELAY_MS+"ms",
   "| CONC="+MAX_CONCURRENCY,
   "| RPS="+GLOBAL_RPS,
   "| oneShot="+STRICT_ONE_SHOT,
