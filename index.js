@@ -5,46 +5,95 @@ import WebSocket from "ws";
 // Конфиг
 // ============================
 const WS_URL = "wss://pumpportal.fun/api/data";
-const API = "https://frontend-api.pump.fun";
+const API_BASES = [
+  "https://frontend-api-v3.pump.fun",
+  "https://frontend-api.pump.fun"
+];
 
 const DEBOUNCE_MS_MIN = 900;   // первая задержка
 const DEBOUNCE_MS_MAX = 1200;
-const QUICK_RECHECKS = 6;      // сколько быстрых проверок
+const QUICK_RECHECKS  = 6;     // сколько быстрых проверок
 const QUICK_STEP_MS   = 500;   // интервал между ними
+const RPS_DELAY_MS    = 120;   // лёгкий глобальный троттлинг
 
 // ============================
 // Вспомогательные
 // ============================
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const pending = new Set();
+let nextAllowedAt = 0;
 
-// аккуратный fetch с no-cache и ретраями
-async function fetchCoinSafe(mint, retries = 2) {
-  const url = `${API}/coins/${mint}?_=${Date.now()}`;
-  for (let i = 0; i <= retries; i++) {
-    try {
-      const r = await fetch(url, {
-        headers: {
-          "accept": "application/json, text/plain, */*",
-          "cache-control": "no-cache, no-store",
-          "pragma": "no-cache",
-          "user-agent": "live-sniffer/mini"
-        }
-      });
-      const text = await r.text();
-      if (!text || !text.trim()) throw new Error("empty-body");
-      return JSON.parse(text);
-    } catch (e) {
-      if (i < retries) {
-        await sleep(350 + i * 200);
-        continue;
-      }
-      throw e;
-    }
-  }
+async function throttle() {
+  const now = Date.now();
+  if (now < nextAllowedAt) await sleep(nextAllowedAt - now);
+  nextAllowedAt = Date.now() + RPS_DELAY_MS;
 }
 
-// проверка лайва (дебаунс + быстрые ре-чеки)
+function isProbablyHtml(text) {
+  if (!text) return false;
+  const s = text.trim().slice(0, 64).toLowerCase();
+  return s.startsWith("<!doctype") || s.startsWith("<html");
+}
+
+// аккуратный fetch с проверкой контента + фолбэки по доменам
+async function fetchCoinSafe(mint, totalRetries = 3) {
+  const qs = `?_=${Date.now()}`;
+  const headers = {
+    "accept": "application/json, text/plain, */*",
+    "cache-control": "no-cache, no-store",
+    "pragma": "no-cache",
+    "user-agent": "live-sniffer/mini"
+  };
+
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= totalRetries; attempt++) {
+    for (const base of API_BASES) {
+      const url = `${base}/coins/${mint}${qs}`;
+      try {
+        await throttle();
+        const r = await fetch(url, { headers, redirect: "follow" });
+        const ct = (r.headers.get("content-type") || "").toLowerCase();
+        const text = await r.text();
+
+        if (!r.ok) {
+          // 403/404/5xx — пробуем другой base или ретрай
+          lastErr = new Error(`HTTP ${r.status}`);
+          continue;
+        }
+        if (!text || !text.trim()) {
+          lastErr = new Error("empty-body");
+          continue;
+        }
+        if (!ct.includes("application/json") || isProbablyHtml(text)) {
+          // отдали HTML (CF/редирект-страница) — пробуем другой base/ретрай
+          lastErr = new Error("html-response");
+          continue;
+        }
+
+        // Парсим JSON
+        try {
+          return JSON.parse(text);
+        } catch (e) {
+          lastErr = new Error("bad-json");
+          continue;
+        }
+      } catch (e) {
+        lastErr = e;
+        // пробуем следующий base или ещё один круг
+        continue;
+      }
+    }
+
+    // короткий бэкофф перед следующим кругом
+    if (attempt < totalRetries) {
+      await sleep(300 + attempt * 200);
+    }
+  }
+
+  throw lastErr || new Error("unknown-fetch-failure");
+}
+
 async function confirmLive(mint) {
   if (pending.has(mint)) return;
   pending.add(mint);
@@ -82,17 +131,23 @@ async function confirmLive(mint) {
       return;
 
     } catch (e) {
+      // если контент HTML/пустой — просто повторяем быстрый чек
+      const msg = (e && e.message) ? e.message : String(e);
+      if (["html-response","empty-body","bad-json"].includes(msg) && i < QUICK_RECHECKS) {
+        await sleep(QUICK_STEP_MS);
+        continue;
+      }
       if (i < QUICK_RECHECKS) {
         await sleep(QUICK_STEP_MS);
         continue;
       }
-      console.log(`❌ fetch error: ${e.message} | mint: ${mint}`);
+      console.log(`❌ fetch error: ${msg} | mint: ${mint}`);
       pending.delete(mint);
       return;
     }
   }
 
-  if (pending.has(mint)) pending.delete(mint);
+  pending.delete(mint);
 }
 
 // ============================
@@ -123,7 +178,5 @@ ws.on("error", (err) => {
 
 ws.on("close", () => {
   console.error("WS closed, reconnecting in 3s...");
-  setTimeout(() => {
-    process.exit(1); // Render сам перезапустит
-  }, 3000);
+  setTimeout(() => process.exit(1), 3000); // Render перезапустит
 });
