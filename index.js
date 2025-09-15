@@ -1,4 +1,4 @@
-// index.js — v6.1.1 (API queue + Viewers queue ≥30 in 30s) + Telegram + Chromium serverless
+// index.js — v7.0.0 (single page reuse, no global task timeout, 30s sampling window)
 import WebSocket from "ws";
 import fetch from "node-fetch";
 import chromium from "@sparticuz/chromium";
@@ -7,29 +7,24 @@ import puppeteer from "puppeteer-core";
 const WS_URL = "wss://pumpportal.fun/api/data";
 const API = "https://frontend-api-v3.pump.fun";
 
-// === Telegram (замени позже на свои)
-const TG_TOKEN = "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc";
-const TG_CHAT_ID = "-4857972467";
+// === Telegram (замени позже на свои либо вынеси в ENV)
+const TG_TOKEN = process.env.TG_TOKEN || "REPLACE_ME";
+const TG_CHAT_ID = process.env.TG_CHAT_ID || "REPLACE_ME";
 
 // === API очередь ===
-const MIN_GAP_MS = 1500;          // глобальный RPS ~0.66
-const MAX_LIFETIME_MS = 120_000;  // ждём LIVE до 2 минут
-const MAX_QUEUE = 1000;
+const MIN_GAP_MS = 1500;         // глобальный RPS ~0.66
+const MAX_LIFETIME_MS = 120_000; // ждём LIVE до 2 минут
+const MAX_QUEUE = 2000;          // просто страховочный, но фактически лимит снят
 const MAX_RETRIES = 2;
 
-// === Очередь зрителей ===
+// === Логика зрителей (упрощённая) ===
 const VIEWERS_THRESHOLD = 30;
-const VIEWERS_WINDOW_MS = 30_000;           // 30 секунд
-const VIEWERS_STEP_MS = 5_000;              // шаг 5 сек
-const VIEWERS_ITER = Math.floor(VIEWERS_WINDOW_MS / VIEWERS_STEP_MS); // 6 замеров
-const VIEWERS_QUEUE_MAX = 200;
-const VIEWERS_CONCURRENCY = 1;              // можно 2, если захочешь
-const VIEWERS_DELAY_BETWEEN_TASKS = 3000;
-const VIEWERS_PAGE_TIMEOUT = 20_000;        // ↑ против таймаутов
-const VIEWERS_TASK_TIMEOUT = 45_000;        // ↑ общий лимит задачи
+const SAMPLE_STEP_MS = 5_000;         // каждые 5 сек
+const SAMPLE_ITER = 6;                 // 30 сек окно
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 
+// ——— состояние
 let ws;
 let lastWsMsgAt = 0;
 let lastLiveAt = 0;
@@ -45,13 +40,21 @@ const metrics = {
 };
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
+const nowMs = () => Date.now();
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// === мини-таймер для этапов
+function makeTimer() {
+  const t0 = nowMs();
+  return () => nowMs() - t0;
+}
 
 // ——— глобальный троттлер REST
 let nextAvailableAt = 0;
 async function throttle() {
-  const now = Date.now();
-  if (now < nextAvailableAt) await new Promise(r => setTimeout(r, nextAvailableAt - now));
-  nextAvailableAt = Date.now() + MIN_GAP_MS;
+  const now = nowMs();
+  if (now < nextAvailableAt) await sleep(nextAvailableAt - now);
+  nextAvailableAt = nowMs() + MIN_GAP_MS;
 }
 
 // ——— безопасный GET JSON
@@ -64,15 +67,15 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/6.1.1"
+          "user-agent": "pumplive-watcher/7.0.0"
         }
       });
 
       if (r.status === 429) {
         metrics.http429++;
         const waitMs = 2000 + Math.random() * 2000;
-        nextAvailableAt = Date.now() + waitMs;
-        await new Promise(res => setTimeout(res, waitMs));
+        nextAvailableAt = nowMs() + waitMs;
+        await sleep(waitMs);
         continue;
       }
 
@@ -92,7 +95,7 @@ async function safeGetJson(url) {
     } catch (e) {
       if (attempt < MAX_RETRIES) {
         metrics.retries++;
-        await new Promise(res => setTimeout(res, 400 * (attempt + 1)));
+        await sleep(400 * (attempt + 1));
         continue;
       }
       metrics.skippedNull++;
@@ -116,7 +119,7 @@ function extractOfficialSocials(coin) {
 
 // ——— Telegram
 async function sendTG({ text, photo }) {
-  if (!TG_TOKEN || !TG_CHAT_ID) return;
+  if (!TG_TOKEN || !TG_CHAT_ID || TG_TOKEN === "REPLACE_ME") return;
   try {
     if (photo) {
       await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`, {
@@ -143,33 +146,33 @@ const queue = []; // [{ mint, name, symbol, enqueuedAt, expiresAt, nextTryAt }]
 function enqueue(mint, name = "", symbol = "") {
   if (inQueue.has(mint)) return;
   if (inQueue.size >= MAX_QUEUE) return;
-  const now = Date.now();
+  const now = nowMs();
   queue.push({ mint, name, symbol, enqueuedAt: now, expiresAt: now + MAX_LIFETIME_MS, nextTryAt: now });
   inQueue.add(mint);
 }
-function requeue(item) { item.nextTryAt = Date.now() + 4000; queue.push(item); }
+function requeue(item) { item.nextTryAt = nowMs() + 4000; queue.push(item); }
 function queueSize() { return inQueue.size; }
 
 async function apiWorkerLoop() {
   while (true) {
-    let idx = -1; const now = Date.now();
+    let idx = -1; const now = nowMs();
     for (let i = 0; i < queue.length; i++) if (queue[i].nextTryAt <= now) { idx = i; break; }
-    if (idx === -1) { await new Promise(r => setTimeout(r, 250)); continue; }
+    if (idx === -1) { await sleep(250); continue; }
 
     const item = queue.splice(idx, 1)[0];
     const { mint, name, symbol, expiresAt } = item;
-    if (Date.now() > expiresAt) { inQueue.delete(mint); continue; }
+    if (nowMs() > expiresAt) { inQueue.delete(mint); continue; }
 
     const coin = await safeGetJson(`${API}/coins/${mint}`);
     if (!coin) { requeue(item); continue; }
 
     if (coin.is_currently_live) {
       const socials = extractOfficialSocials(coin);
-      if (socials.length === 0) { inQueue.delete(mint); continue; } // твой фильтр
+      if (socials.length === 0) { inQueue.delete(mint); continue; } // фильтр: минимум 1 соцсеть
 
       inQueue.delete(mint);
       enqueueViewers({ mint, coin, fallbackName: name, fallbackSymbol: symbol });
-      lastLiveAt = Date.now();
+      lastLiveAt = nowMs();
 
       log(`🎥 LIVE START | ${coin.name || name} (${coin.symbol || symbol})`);
       log(`   mint: ${mint}`);
@@ -182,16 +185,16 @@ async function apiWorkerLoop() {
   }
 }
 
-// ===================== ОЧЕРЕДЬ ЗРИТЕЛЕЙ =====================
+// ===================== ОЧЕРЕДЬ ЗРИТЕЛЕЙ (упростили) =====================
 const viewersQueue = [];
 const viewersInQueue = new Set();
 let browser = null;
+let page = null;
 let viewersActive = 0;
 
 function enqueueViewers({ mint, coin, fallbackName = "", fallbackSymbol = "" }) {
   if (viewersInQueue.has(mint)) return;
-  if (viewersQueue.length >= VIEWERS_QUEUE_MAX) { metrics.viewerTasksDropped++; return; }
-  viewersQueue.push({ mint, coin, fallbackName, fallbackSymbol, enqueuedAt: Date.now() });
+  viewersQueue.push({ mint, coin, fallbackName, fallbackSymbol, enqueuedAt: nowMs() });
   viewersInQueue.add(mint);
 }
 
@@ -200,14 +203,52 @@ async function getBrowser() {
   const execPath = await chromium.executablePath();
   browser = await puppeteer.launch({
     executablePath: execPath,
-    args: [...chromium.args, "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-    headless: chromium.headless
+    args: [
+      ...chromium.args,
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--single-process",            // помогает на ограниченных окружениях
+      "--disable-gpu"
+    ],
+    headless: chromium.headless,
+    protocolTimeout: 180_000 // ← увеличили CDP таймаут для операций типа Target.createTarget/Network.enable
   });
   log("✅ Chromium ready:", execPath);
   return browser;
 }
 
+async function getPage() {
+  const t = makeTimer();
+  const br = await getBrowser();
+  let reused = false;
+  try {
+    if (page && !page.isClosed()) {
+      // быстрая проверка, что CDP жив (можем дернуть title)
+      try { await page.title(); reused = true; }
+      catch { page = null; reused = false; }
+    }
+    if (!page || page.isClosed()) {
+      page = await br.newPage();
+      await page.setUserAgent(UA);
+      await page.setViewport({ width: 1280, height: 800 });
+      page.setDefaultTimeout(60_000);              // таймауты Puppeteer (не общий, а для операций)
+      page.setDefaultNavigationTimeout(60_000);
+    }
+    log(`🧊 chrome:warmup ok=true reused=${reused} dt=${t()}ms`);
+    return page;
+  } catch (e) {
+    metrics.viewerOpenErrors++;
+    log(`❌ page:new error=${e.message} dt=${t()}ms`);
+    // пробуем полный рестарт браузера
+    try { await browser?.close(); } catch {}
+    browser = null; page = null;
+    throw e;
+  }
+}
+
 async function checkViewersOnce(page) {
+  // Не включаем request interception — избегаем лишнего Network.enable
   const liveHandle = await page.$("#live-indicator");
   if (!liveHandle) return { ok: false, viewers: null, reason: "no_live_indicator" };
   const viewersHandle = await page.evaluateHandle(
@@ -223,78 +264,90 @@ async function checkViewersOnce(page) {
 
 async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
   metrics.viewerTasksStarted++;
-  let page;
+  const jobTimer = makeTimer();
+  log(`▶️ viewers:start mint=${mint} name="${coin?.name || fallbackName}" symbol="${coin?.symbol || fallbackSymbol}"`);
+
+  let pg;
   try {
-    const br = await getBrowser();
-    page = await br.newPage();
+    // 1) Получаем/создаём вкладку (реюз)
+    pg = await getPage();
 
-    // Ускоряем/стабилизируем загрузку страницы
-    await page.setUserAgent(UA);
-    await page.setViewport({ width: 1280, height: 800 });
-
-    await page.setRequestInterception(true);
-    page.on("request", req => {
-      const t = req.resourceType();
-      if (t === "image" || t === "font" || t === "media" || t === "stylesheet") return req.abort();
-      req.continue();
-    });
-
-    // Навигация с одним авторетрайем
-    let navigated = false;
+    // 2) Навигация
+    const tNav = makeTimer();
+    const url = `https://pump.fun/coin/${mint}`;
+    log(`🌐 goto:start url=${url}`);
     try {
-      await page.goto(`https://pump.fun/coin/${mint}`, { waitUntil: "domcontentloaded", timeout: VIEWERS_PAGE_TIMEOUT });
-      navigated = true;
-    } catch (_) {
-      // одна повторная попытка
-      await new Promise(r => setTimeout(r, 1000));
-      await page.goto(`https://pump.fun/coin/${mint}`, { waitUntil: "domcontentloaded", timeout: VIEWERS_PAGE_TIMEOUT });
-      navigated = true;
+      await pg.goto(url, { waitUntil: "domcontentloaded" }); // без request interception
+      const extraWait = 1500;
+      await sleep(extraWait);
+      log(`🌐 goto:done dt_nav=${tNav()}ms wait_dom_extra=${extraWait}ms`);
+    } catch (e) {
+      log(`🌐 goto:error kind=${/timeout/i.test(e.message) ? "timeout" : "other"} dt=${tNav()}ms msg="${e.message}"`);
+      // пробуем мягкий рефреш один раз
+      await sleep(1000);
+      const tNav2 = makeTimer();
+      try {
+        await pg.goto(url, { waitUntil: "domcontentloaded" });
+        const extraWait = 1500;
+        await sleep(extraWait);
+        log(`🌐 goto:retry_success dt_nav=${tNav2()}ms wait_dom_extra=${extraWait}ms`);
+      } catch (e2) {
+        // если страница не открылась — считаем задачу неисполненной
+        metrics.viewerTasksDropped++;
+        log(`❌ goto:failed_twice dt1=${tNav()}ms dt2=${tNav2()}ms msg2="${e2.message}"`);
+        return;
+      }
     }
 
-    // Ждём целевой селектор (если он вообще есть)
+    // 3) Пробуем быстро дождаться индикатор (но это не обязаловка)
+    const tSel = makeTimer();
+    let selectorFound = true;
     try {
-      await page.waitForSelector("#live-indicator", { timeout: 15000 });
-    } catch { /* ок, будем пробовать читать напрямую */ }
+      await pg.waitForSelector("#live-indicator", { timeout: 10_000 });
+      log(`🔎 live-indicator:found=true dt=${tSel()}ms`);
+    } catch {
+      selectorFound = false;
+      metrics.viewerSelectorMiss++;
+      log(`🔎 live-indicator:found=false dt=${tSel()}ms reason=timeout_or_missing`);
+    }
 
+    // 4) 30 секунд измерений (6×)
     let maxV = -1;
-    let sent = false;
+    for (let i = 0; i < SAMPLE_ITER; i++) {
+      const tSample = makeTimer();
+      let res;
+      try { res = await checkViewersOnce(pg); }
+      catch (e) {
+        log(`📊 sample i=${i + 1}/${SAMPLE_ITER} error="${e.message}" dt=${tSample()}ms`);
+        if (i < SAMPLE_ITER - 1) await sleep(SAMPLE_STEP_MS);
+        continue;
+      }
 
-    for (let i = 0; i < VIEWERS_ITER; i++) {
-      const res = await checkViewersOnce(page);
       if (!res.ok) {
-        if (res.reason === "no_live_indicator" || res.reason === "no_viewers_span") {
-          metrics.viewerSelectorMiss++;
-        }
+        log(`📊 sample i=${i + 1}/${SAMPLE_ITER} ok=false reason=${res.reason} dt=${tSample()}ms`);
       } else {
-        if (res.viewers > maxV) maxV = res.viewers;
+        maxV = Math.max(maxV, res.viewers);
+        log(`📊 sample i=${i + 1}/${SAMPLE_ITER} ok=true viewers=${res.viewers} dt=${tSample()}ms`);
         if (res.viewers >= VIEWERS_THRESHOLD) {
-          await notifyTelegram(mint, coin, fallbackName, fallbackSymbol, res.viewers);
-          sent = true;
-          break;
+          await notifyTelegram(mint, coin, fallbackName, fallbackSymbol, res.viewers, jobTimer());
+          metrics.viewerTasksDone++;
+          return;
         }
       }
-      if (i < VIEWERS_ITER - 1) await new Promise(r => setTimeout(r, VIEWERS_STEP_MS));
+
+      if (i < SAMPLE_ITER - 1) await sleep(SAMPLE_STEP_MS);
     }
 
-    if (!sent && maxV >= VIEWERS_THRESHOLD) {
-      await notifyTelegram(mint, coin, fallbackName, fallbackSymbol, maxV);
-      sent = true;
-    }
-
-    if (!sent) {
-      log(`ℹ️ Skipped Telegram (viewers < ${VIEWERS_THRESHOLD}) | mint=${mint} max=${maxV < 0 ? "n/a" : maxV}`);
-    }
-
+    // 5) Порог не достигнут — логируем и выходим
+    log(`⏭️ threshold:miss max=${maxV < 0 ? "n/a" : maxV} t_window=30s t_total=${jobTimer()}ms`);
     metrics.viewerTasksDone++;
   } catch (e) {
     metrics.viewerOpenErrors++;
-    log("⚠️ viewers task error:", e.message);
-  } finally {
-    try { await page?.close({ runBeforeUnload: false }); } catch {}
+    log(`⚠️ viewers task error: ${e.message}`);
   }
 }
 
-async function notifyTelegram(mint, coin, fallbackName, fallbackSymbol, viewers) {
+async function notifyTelegram(mint, coin, fallbackName, fallbackSymbol, viewers, tTotalMs) {
   const socials = extractOfficialSocials(coin);
   const title = `${coin.name || fallbackName} (${coin.symbol || fallbackSymbol})`;
   const mcapStr = typeof coin.usd_market_cap === "number" ? `$${formatNumber(coin.usd_market_cap)}` : "n/a";
@@ -310,29 +363,35 @@ async function notifyTelegram(mint, coin, fallbackName, fallbackSymbol, viewers)
   ].join("\n");
 
   const photoUrl = coin?.image_uri || null;
-  log("📤 sending to Telegram…");
-  sendTG({ text: msg, photo: photoUrl })
-    .then(() => log("✅ sent to Telegram"))
-    .catch(e => log("⚠️ TG error:", e.message));
+  log(`✅ threshold:hit viewers=${viewers} t_total=${tTotalMs}ms`);
+  log("📤 tg:send start");
+  try {
+    await sendTG({ text: msg, photo: photoUrl });
+    log("✅ tg:sent");
+  } catch (e) {
+    log("⚠️ tg:error:", e.message);
+  }
 }
 
 async function viewersWorkerLoop() {
   while (true) {
-    if (viewersActive >= VIEWERS_CONCURRENCY || viewersQueue.length === 0) {
-      await new Promise(r => setTimeout(r, 200));
+    if (viewersActive >= 1 || viewersQueue.length === 0) {
+      await sleep(100);
       continue;
     }
     const job = viewersQueue.shift();
     viewersInQueue.delete(job.mint);
 
     viewersActive++;
-    const task = viewersTask(job);
-
-    // общий лимит на задачу
-    const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error("viewer task timeout")), VIEWERS_TASK_TIMEOUT));
-    try { await Promise.race([task, timeout]); }
-    catch (e) { metrics.viewerTasksDropped++; log("⚠️ viewers task dropped:", e.message); }
-    finally { viewersActive--; await new Promise(r => setTimeout(r, VIEWERS_DELAY_BETWEEN_TASKS)); }
+    try { await viewersTask(job); }
+    catch (e) {
+      metrics.viewerTasksDropped++;
+      log("⚠️ viewers task dropped:", e.message);
+    } finally {
+      viewersActive--;
+      // короткая пауза между задачами, чтобы страница успела "отпустить" CPU
+      await sleep(500);
+    }
   }
 }
 
@@ -346,7 +405,7 @@ function connect() {
   });
 
   ws.on("message", (raw) => {
-    lastWsMsgAt = Date.now();
+    lastWsMsgAt = nowMs();
     let msg; try { msg = JSON.parse(raw.toString()); } catch { return; }
     const mint = msg?.mint || msg?.tokenMint || msg?.ca || null;
     if (!mint) return;
@@ -366,7 +425,7 @@ function connect() {
 
 // ===================== Heartbeat =====================
 setInterval(() => {
-  const now = Date.now();
+  const now = nowMs();
   const secSinceWs = lastWsMsgAt ? Math.round((now - lastWsMsgAt) / 1000) : -1;
   const minSinceLive = lastLiveAt ? Math.round((now - lastLiveAt) / 60000) : -1;
   console.log(
@@ -374,8 +433,9 @@ setInterval(() => {
     `req=${metrics.requests} ok=${metrics.ok} retries=${metrics.retries} ` +
     `429=${metrics.http429} other=${metrics.httpOther} empty=${metrics.emptyBody} ` +
     `null=${metrics.skippedNull} reconnects=${metrics.reconnects}  ` +
-    `vQ=${viewersQueue.length}/${VIEWERS_QUEUE_MAX} vRun=${viewersActive} ` +
-    `vStart=${metrics.viewerTasksStarted} vDone=${metrics.viewerTasksDone} vDrop=${metrics.viewerTasksDropped}`
+    `vQ=${viewersQueue.length} vRun=${viewersActive} ` +
+    `vStart=${metrics.viewerTasksStarted} vDone=${metrics.viewerTasksDone} vDrop=${metrics.viewerTasksDropped} ` +
+    `vOpenErr=${metrics.viewerOpenErrors} vSelMiss=${metrics.viewerSelectorMiss}`
   );
   if (secSinceWs >= 0 && secSinceWs > 300) {
     console.log(`[guard] no WS messages for ${secSinceWs}s → force reconnect`);
