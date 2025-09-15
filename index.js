@@ -1,4 +1,4 @@
-// index.js — v7.0.0 (single page reuse, no global task timeout, 30s sampling window)
+// index.js — v7.1.0 (single page reuse, 30s selector wait, smart viewers finder, DOM diagnostics)
 import WebSocket from "ws";
 import fetch from "node-fetch";
 import chromium from "@sparticuz/chromium";
@@ -7,29 +7,27 @@ import puppeteer from "puppeteer-core";
 const WS_URL = "wss://pumpportal.fun/api/data";
 const API = "https://frontend-api-v3.pump.fun";
 
-// === Telegram (замени позже на свои либо вынеси в ENV)
+// === Telegram (замени на ENV)
 const TG_TOKEN = process.env.TG_TOKEN || "REPLACE_ME";
 const TG_CHAT_ID = process.env.TG_CHAT_ID || "REPLACE_ME";
 
 // === API очередь ===
-const MIN_GAP_MS = 1500;         // глобальный RPS ~0.66
-const MAX_LIFETIME_MS = 120_000; // ждём LIVE до 2 минут
-const MAX_QUEUE = 2000;          // просто страховочный, но фактически лимит снят
+const MIN_GAP_MS = 1500;
+const MAX_LIFETIME_MS = 120_000;
+const MAX_QUEUE = 2000;
 const MAX_RETRIES = 2;
 
-// === Логика зрителей (упрощённая) ===
+// === Зрители ===
 const VIEWERS_THRESHOLD = 30;
-const SAMPLE_STEP_MS = 5_000;         // каждые 5 сек
-const SAMPLE_ITER = 6;                 // 30 сек окно
+const SAMPLE_STEP_MS = 5_000;
+const SAMPLE_ITER = 6;
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 
-// ——— состояние
 let ws;
 let lastWsMsgAt = 0;
 let lastLiveAt = 0;
 
-// ——— метрики
 const metrics = {
   requests: 0, ok: 0, retries: 0,
   http429: 0, httpOther: 0,
@@ -42,14 +40,9 @@ const metrics = {
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 const nowMs = () => Date.now();
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function makeTimer() { const t0 = nowMs(); return () => nowMs() - t0; }
 
-// === мини-таймер для этапов
-function makeTimer() {
-  const t0 = nowMs();
-  return () => nowMs() - t0;
-}
-
-// ——— глобальный троттлер REST
+// ——— REST троттлинг
 let nextAvailableAt = 0;
 async function throttle() {
   const now = nowMs();
@@ -67,7 +60,7 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/7.0.0"
+          "user-agent": "pumplive-watcher/7.1.0"
         }
       });
 
@@ -141,7 +134,7 @@ async function sendTG({ text, photo }) {
 
 // ===================== API ОЧЕРЕДЬ =====================
 const inQueue = new Set();
-const queue = []; // [{ mint, name, symbol, enqueuedAt, expiresAt, nextTryAt }]
+const queue = [];
 
 function enqueue(mint, name = "", symbol = "") {
   if (inQueue.has(mint)) return;
@@ -168,7 +161,7 @@ async function apiWorkerLoop() {
 
     if (coin.is_currently_live) {
       const socials = extractOfficialSocials(coin);
-      if (socials.length === 0) { inQueue.delete(mint); continue; } // фильтр: минимум 1 соцсеть
+      if (socials.length === 0) { inQueue.delete(mint); continue; }
 
       inQueue.delete(mint);
       enqueueViewers({ mint, coin, fallbackName: name, fallbackSymbol: symbol });
@@ -185,7 +178,7 @@ async function apiWorkerLoop() {
   }
 }
 
-// ===================== ОЧЕРЕДЬ ЗРИТЕЛЕЙ (упростили) =====================
+// ===================== ОЧЕРЕДЬ ЗРИТЕЛЕЙ =====================
 const viewersQueue = [];
 const viewersInQueue = new Set();
 let browser = null;
@@ -208,11 +201,11 @@ async function getBrowser() {
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
-      "--single-process",            // помогает на ограниченных окружениях
+      "--single-process",
       "--disable-gpu"
     ],
     headless: chromium.headless,
-    protocolTimeout: 180_000 // ← увеличили CDP таймаут для операций типа Target.createTarget/Network.enable
+    protocolTimeout: 180_000
   });
   log("✅ Chromium ready:", execPath);
   return browser;
@@ -224,7 +217,6 @@ async function getPage() {
   let reused = false;
   try {
     if (page && !page.isClosed()) {
-      // быстрая проверка, что CDP жив (можем дернуть title)
       try { await page.title(); reused = true; }
       catch { page = null; reused = false; }
     }
@@ -232,7 +224,7 @@ async function getPage() {
       page = await br.newPage();
       await page.setUserAgent(UA);
       await page.setViewport({ width: 1280, height: 800 });
-      page.setDefaultTimeout(60_000);              // таймауты Puppeteer (не общий, а для операций)
+      page.setDefaultTimeout(60_000);
       page.setDefaultNavigationTimeout(60_000);
     }
     log(`🧊 chrome:warmup ok=true reused=${reused} dt=${t()}ms`);
@@ -240,26 +232,53 @@ async function getPage() {
   } catch (e) {
     metrics.viewerOpenErrors++;
     log(`❌ page:new error=${e.message} dt=${t()}ms`);
-    // пробуем полный рестарт браузера
     try { await browser?.close(); } catch {}
     browser = null; page = null;
     throw e;
   }
 }
 
-async function checkViewersOnce(page) {
-  // Не включаем request interception — избегаем лишнего Network.enable
-  const liveHandle = await page.$("#live-indicator");
-  if (!liveHandle) return { ok: false, viewers: null, reason: "no_live_indicator" };
-  const viewersHandle = await page.evaluateHandle(
-    el => el && el.parentElement && el.parentElement.querySelector("span"),
-    liveHandle
-  );
-  if (!viewersHandle) return { ok: false, viewers: null, reason: "no_viewers_span" };
-  const txt = await viewersHandle.evaluate(el => (el.textContent || "").trim());
-  const num = Number((txt.match(/\d+/) || [null])[0]);
-  if (!Number.isFinite(num)) return { ok: false, viewers: null, reason: "not_a_number" };
-  return { ok: true, viewers: num };
+// ——— “умный” поиск числа зрителей с фолбэками
+async function findViewersNumber(pg) {
+  return await pg.evaluate(() => {
+    const pickNumber = (txt) => {
+      const m = (txt || "").match(/\d{1,6}/);
+      return m ? Number(m[0]) : null;
+    };
+
+    const roots = [
+      document.querySelector('#live-indicator'),
+      document.querySelector('[data-testid*="live" i]'),
+      document.querySelector('[class*="live"][class*="indicator"]'),
+      Array.from(document.querySelectorAll('span,div,b,strong'))
+        .find(n => /live/i.test(n.textContent || '')) || null,
+    ].filter(Boolean);
+
+    for (const root of roots) {
+      let span = root.querySelector(':scope > span') ||
+                 root.parentElement?.querySelector('span') ||
+                 root.closest('div')?.querySelector('span');
+      const n = span ? pickNumber(span.textContent) : null;
+      if (Number.isFinite(n)) return { ok: true, viewers: n, via: 'fallback' };
+    }
+
+    // Последняя попытка: глобальный поиск “Live” + число в одном блоке
+    const blocks = Array.from(document.querySelectorAll('div,section,header'));
+    for (const el of blocks) {
+      const t = (el.textContent || '').trim();
+      if (/live/i.test(t)) {
+        const n = pickNumber(t);
+        if (Number.isFinite(n)) return { ok: true, viewers: n, via: 'global' };
+      }
+    }
+    return { ok: false, reason: 'no_live_indicator' };
+  });
+}
+
+async function checkViewersOnce(pg) {
+  const res = await findViewersNumber(pg);
+  if (!res.ok) return { ok: false, viewers: null, reason: res.reason || 'unknown' };
+  return { ok: true, viewers: res.viewers };
 }
 
 async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
@@ -269,21 +288,20 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
 
   let pg;
   try {
-    // 1) Получаем/создаём вкладку (реюз)
+    // 1) вкладка
     pg = await getPage();
 
-    // 2) Навигация
+    // 2) навигация
     const tNav = makeTimer();
     const url = `https://pump.fun/coin/${mint}`;
     log(`🌐 goto:start url=${url}`);
     try {
-      await pg.goto(url, { waitUntil: "domcontentloaded" }); // без request interception
+      await pg.goto(url, { waitUntil: "domcontentloaded" });
       const extraWait = 1500;
       await sleep(extraWait);
       log(`🌐 goto:done dt_nav=${tNav()}ms wait_dom_extra=${extraWait}ms`);
     } catch (e) {
       log(`🌐 goto:error kind=${/timeout/i.test(e.message) ? "timeout" : "other"} dt=${tNav()}ms msg="${e.message}"`);
-      // пробуем мягкий рефреш один раз
       await sleep(1000);
       const tNav2 = makeTimer();
       try {
@@ -292,18 +310,17 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
         await sleep(extraWait);
         log(`🌐 goto:retry_success dt_nav=${tNav2()}ms wait_dom_extra=${extraWait}ms`);
       } catch (e2) {
-        // если страница не открылась — считаем задачу неисполненной
         metrics.viewerTasksDropped++;
         log(`❌ goto:failed_twice dt1=${tNav()}ms dt2=${tNav2()}ms msg2="${e2.message}"`);
         return;
       }
     }
 
-    // 3) Пробуем быстро дождаться индикатор (но это не обязаловка)
+    // 3) ждём индикатор не дольше 30с (если появится раньше — идём дальше сразу)
     const tSel = makeTimer();
     let selectorFound = true;
     try {
-      await pg.waitForSelector("#live-indicator", { timeout: 10_000 });
+      await pg.waitForSelector("#live-indicator", { timeout: 30_000 });
       log(`🔎 live-indicator:found=true dt=${tSel()}ms`);
     } catch {
       selectorFound = false;
@@ -311,8 +328,9 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
       log(`🔎 live-indicator:found=false dt=${tSel()}ms reason=timeout_or_missing`);
     }
 
-    // 4) 30 секунд измерений (6×)
+    // 4) 30с измерений (6×)
     let maxV = -1;
+    let consecutiveMiss = 0;
     for (let i = 0; i < SAMPLE_ITER; i++) {
       const tSample = makeTimer();
       let res;
@@ -324,8 +342,21 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
       }
 
       if (!res.ok) {
+        consecutiveMiss++;
         log(`📊 sample i=${i + 1}/${SAMPLE_ITER} ok=false reason=${res.reason} dt=${tSample()}ms`);
+
+        // Диагностика DOM при повторных промахах (на 2-м и 3-м тиках)
+        if (consecutiveMiss === 2 || consecutiveMiss === 3) {
+          try {
+            const dump = await pg.evaluate(() => {
+              const text = (document.body?.innerText || "").slice(0, 2000).replace(/\s+/g, " ");
+              return { hasLive: /live/i.test(text), head: text };
+            });
+            console.log(`${new Date().toISOString()} 🧪 dom: hasLive=${dump.hasLive} head="${dump.head}"`);
+          } catch {}
+        }
       } else {
+        consecutiveMiss = 0;
         maxV = Math.max(maxV, res.viewers);
         log(`📊 sample i=${i + 1}/${SAMPLE_ITER} ok=true viewers=${res.viewers} dt=${tSample()}ms`);
         if (res.viewers >= VIEWERS_THRESHOLD) {
@@ -338,7 +369,7 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol }) {
       if (i < SAMPLE_ITER - 1) await sleep(SAMPLE_STEP_MS);
     }
 
-    // 5) Порог не достигнут — логируем и выходим
+    // 5) не дотянули
     log(`⏭️ threshold:miss max=${maxV < 0 ? "n/a" : maxV} t_window=30s t_total=${jobTimer()}ms`);
     metrics.viewerTasksDone++;
   } catch (e) {
@@ -389,7 +420,6 @@ async function viewersWorkerLoop() {
       log("⚠️ viewers task dropped:", e.message);
     } finally {
       viewersActive--;
-      // короткая пауза между задачами, чтобы страница успела "отпустить" CPU
       await sleep(500);
     }
   }
