@@ -1,8 +1,10 @@
-// index.js — v7.5.0
-// - Предпроверка API перед запуском Chromium (если уже не LIVE — сразу skip)
-// - Ожидание индикатора до 60s, затем 2 замера (каждые 5s)
-// - Таймлайновые метрики: detect→taskStart, taskStart→navDone, navDone→indicator, indicator→samples, detect→checked
-// - Монитор ресурсов: CPU/RAM/Chrome/active_pages
+// index.js — v7.6.0
+// - Indicator wait: 25s
+// - Samples: every 1s up to 10s (early exit on first >= threshold)
+// - Pre-API check before browser, mid-API check after navigation
+// - Timeline logs (detect→checked etc.)
+// - Resource monitor (CPU/RAM/Chrome pages)
+// - Chromium optimized flags + no cache + bypass SW
 
 import WebSocket from "ws";
 import fetch from "node-fetch";
@@ -14,7 +16,7 @@ import fs from "fs/promises";
 const WS_URL = "wss://pumpportal.fun/api/data";
 const API = "https://frontend-api-v3.pump.fun";
 
-// === Telegram (используй ENV)
+// === Telegram (используй переменные окружения на Render)
 const TG_TOKEN = process.env.TG_TOKEN || "";
 const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
 
@@ -26,8 +28,9 @@ const MAX_RETRIES = 2;
 
 // === Viewers ===
 const VIEWERS_THRESHOLD = 30;
-const INDICATOR_WAIT_MS = 60_000;
-const SAMPLE_STEP_MS = 5_000; // 2 сэмпла по 5s = ~10s
+const INDICATOR_WAIT_MS = 25_000;
+const SAMPLE_STEP_MS = 1_000; // 1s
+const SAMPLE_MAX = 10;        // максимум 10 выборок (до ~10s)
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
 
@@ -68,7 +71,7 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/7.5.0"
+          "user-agent": "pumplive-watcher/7.6.0"
         }
       });
       if (r.status === 429) {
@@ -162,7 +165,7 @@ async function apiWorkerLoop() {
 
     if (coin.is_currently_live) {
       const socials = extractOfficialSocials(coin);
-      if (socials.length === 0) { inQueue.delete(mint); continue; }
+      if (socials.length === 0) { inQueue.delete(mint); continue; } // оставляем твой базовый фильтр
 
       inQueue.delete(mint);
       enqueueViewers({ mint, coin, fallbackName: name, fallbackSymbol: symbol, detectedAt: now(), enqueuedAt });
@@ -182,7 +185,7 @@ async function apiWorkerLoop() {
 // ===================== Viewers =====================
 const viewersQueue = [];
 let browser = null;
-let viewersActive = 0; // concurrency 1 (можно поднять позже)
+let viewersActive = 0; // оставляем 1 из-за 512MB RAM
 
 function enqueueViewers({ mint, coin, fallbackName = "", fallbackSymbol = "", detectedAt, enqueuedAt }) {
   viewersQueue.push({ mint, coin, fallbackName, fallbackSymbol, detectedAt, enqueuedAt });
@@ -199,7 +202,15 @@ async function getBrowser() {
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
       "--single-process",
-      "--disable-gpu"
+      "--disable-gpu",
+      "--disable-background-networking",
+      "--disable-default-apps",
+      "--disable-extensions",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--mute-audio",
+      "--disable-features=Translate,BackForwardCache,InterestCohort,PaintHolding",
+      "--blink-settings=imagesEnabled=false"
     ],
     headless: chromium.headless,
     protocolTimeout: 180_000
@@ -234,11 +245,11 @@ async function checkViewersOnce(pg) {
 }
 
 async function viewersTask(job) {
-  const { mint, coin, fallbackName, fallbackSymbol, detectedAt, enqueuedAt } = job;
+  const { mint, coin, fallbackName, fallbackSymbol, detectedAt } = job;
   metrics.viewerTasksStarted++;
   const taskStartAt = now();
 
-  // ——— Пред-проверка API до поднятия браузера
+  // ——— Пред-проверка API до браузера
   const preApi = await safeGetJson(`${API}/coins/${mint}`);
   if (!preApi?.is_currently_live) {
     const tDetectToNow = taskStartAt - detectedAt;
@@ -251,14 +262,24 @@ async function viewersTask(job) {
   try {
     br = await getBrowser();
     pg = await br.newPage();
+
+    // базовые настройки вкладки
     await pg.setUserAgent(UA);
     await pg.setViewport({ width: 1280, height: 800 });
+
+    // выключаем кеш/ServiceWorker/CSP для предсказуемости
+    try { await pg.setCacheEnabled(false); } catch {}
+    try { await pg.setBypassCSP(true); } catch {}
+    try { await pg._client().send('Network.setBypassServiceWorker', { bypass: true }); } catch {}
+
+    // блокируем тяжелые ресурсы
     await pg.setRequestInterception(true);
     pg.on("request", req => {
       const t = req.resourceType();
       if (t === "image" || t === "font" || t === "media" || t === "stylesheet") return req.abort();
       req.continue();
     });
+
     pg.setDefaultTimeout(60_000);
     pg.setDefaultNavigationTimeout(60_000);
 
@@ -269,11 +290,11 @@ async function viewersTask(job) {
     const url = `https://pump.fun/coin/${mint}`;
     log(`🌐 goto:start url=${url}`);
     await pg.goto(url, { waitUntil: "domcontentloaded" });
-    await sleep(1500);
+    await sleep(1500); // стабилизация
     const navDoneAt = now();
     log(`🌐 goto:done dt_nav=${dt(navDoneAt - navStartAt)} wait_dom_extra=1500ms`);
 
-    // ——— Перед ожиданием индикатора: повторная проверка API (на случай, что токен умер во время навигации)
+    // ——— Mid-API check (мог умереть во время навигации)
     const midApi = await safeGetJson(`${API}/coins/${mint}`);
     if (!midApi?.is_currently_live) {
       const tDetectToNow2 = now() - detectedAt;
@@ -284,7 +305,7 @@ async function viewersTask(job) {
       return;
     }
 
-    // ——— Ожидание индикатора
+    // ——— Ожидание индикатора (25s)
     const selStartAt = now();
     let indicatorFound = true;
     try {
@@ -310,32 +331,37 @@ async function viewersTask(job) {
       return;
     }
 
-    // ——— 2 замера (по 5s)
+    // ——— Замеры: каждую 1s до 10s (ранний выход при первом >= threshold)
     let maxV = -1;
     const measStartAt = now();
-    for (let i = 1; i <= 2; i++) {
+    let hitEarly = false;
+    for (let i = 1; i <= SAMPLE_MAX; i++) {
       const res = await checkViewersOnce(pg);
       if (res.ok) {
         maxV = Math.max(maxV, res.viewers);
-        log(`📊 sample i=${i}/2 ok=true viewers=${res.viewers}`);
+        log(`📊 sample i=${i}/${SAMPLE_MAX} ok=true viewers=${res.viewers}`);
+        if (res.viewers >= VIEWERS_THRESHOLD) {
+          hitEarly = true;
+          break; // ранний выход
+        }
       } else {
-        log(`📊 sample i=${i}/2 ok=false reason=${res.reason}`);
+        log(`📊 sample i=${i}/${SAMPLE_MAX} ok=false reason=${res.reason}`);
       }
-      if (i < 2) await sleep(SAMPLE_STEP_MS);
+      if (i < SAMPLE_MAX) await sleep(SAMPLE_STEP_MS);
     }
     const measDoneAt = now();
 
     // ——— Таймлайны
     const tDetectToTaskStart = taskStartAt - detectedAt;
     const tTaskStartToNavDone = navDoneAt - taskStartAt;
-    const tNavDoneToIndicator = selStartAt - navDoneAt; // время до начала ожидания
+    const tNavDoneToIndicator = selStartAt - navDoneAt;
     const tIndicatorToSamples = measDoneAt - selStartAt;
     const tDetectToChecked = measDoneAt - detectedAt;
 
     if (maxV >= VIEWERS_THRESHOLD) {
       const socials = extractOfficialSocials(coin);
       const title = `${coin?.name || fallbackName} (${coin?.symbol || fallbackSymbol})`;
-      const mcapStr = typeof coin.usd_market_cap === "number" ? `$${coin.usd_market_cap.toFixed(2)}` : "n/a";
+      const mcapStr = typeof coin.usd_market_cap === "number" ? `$${coin?.usd_market_cap.toFixed(2)}` : "n/a";
       const msg = [
         `🎥 <b>LIVE START</b> | ${title}`,
         ``,
@@ -346,7 +372,7 @@ async function viewersTask(job) {
         socials.join("\n")
       ].join("\n");
 
-      log(`✅ threshold:hit viewers=${maxV} ` +
+      log(`✅ threshold:hit viewers=${maxV} early=${hitEarly} ` +
           `timeline detect→taskStart=${dt(tDetectToTaskStart)} ` +
           `taskStart→navDone=${dt(tTaskStartToNavDone)} ` +
           `navDone→indicator=${dt(tNavDoneToIndicator)} ` +
