@@ -1,14 +1,13 @@
 {
   "name": "pumplive",
   "version": "1.0.0",
+  "description": "Pump.fun live sniffer",
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "live": "node index.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "undici": "^6.19.8",
-    "ws": "^8.18.0"
+    "ws": "^8.17.0"
   }
 }
