@@ -172,16 +172,17 @@ async function alertLive(mint, coin, viewers, source="api"){
   if (coin?.telegram) socials.push(`💬 <b>Telegram:</b> ${coin.telegram}`);
   if (coin?.discord)  socials.push(`🎮 <b>Discord:</b> ${coin.discord}`);
 
-  const msg = [
+  const NL = String.fromCharCode(10);
+  const parts = [
     `🎥 <b>LIVE START</b> | ${title}${hasSocials ? "" : " <i>(no socials)</i>"}`,
     `Mint: <code>${mint}</code>`,
     `👁 Viewers: ${fmt(viewers)} (source: ${source})`,
     `💰 Market Cap (USD): ${typeof coin.usd_market_cap==="number" ? "$"+fmt(coin.usd_market_cap) : "n/a"}`,
-    `🔗 Axiom: https://axiom.trade/t/${mint}`,
-    socials.length ? socials.join("
-") : null
-  ].filter(Boolean).join("
-");
+    `🔗 Axiom: https://axiom.trade/t/${mint}`
+  ];
+  if (socials.length) parts.push(socials.join(NL));
+
+  const msg = parts.filter(Boolean).join(NL);
 
   log("tg:send start");
   await sendTG(msg, coin?.image_uri || null);
