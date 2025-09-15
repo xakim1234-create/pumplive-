@@ -1,14 +1,13 @@
-// index.js — v7.7.0 (25s indicator wait, 3x3s samples, before-browser recheck, dedup 10m, rich diagnostics)
+// index.js — v7.8.0
+// Robust LIVE-indicator capture: all frames, late render, reload-if-live, richer diagnostics
+// (25s→40s indicator wait, 90s task timeout, protocolTimeout 60s, delayed interception)
+
 import os from "os";
 import process from "process";
 import puppeteer from "puppeteer-core";
 import chromium from "@sparticuz/chromium";
 import WebSocket from "ws";
 import fetch from "node-fetch";
-
-// === Конфиг прямо тут ===
-const TELEGRAM_BOT_TOKEN = "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc";
-const TELEGRAM_CHAT_ID = "-4857972467";
 
 /* ================== CONFIG ================== */
 const WS_URL = 'wss://pumpportal.fun/api/data';
@@ -26,10 +25,10 @@ const MAX_RETRIES      = 2;
 
 // ——— “Зрители”
 const VIEWERS_THRESHOLD = 30;
-const INDICATOR_WAIT_MS = 25_000;        // ждём индикатор максимум 25с
+const INDICATOR_WAIT_MS = 40_000;        // ждём индикатор до 40с (было 25)
 const SAMPLE_COUNT      = 3;              // 3 замера
 const SAMPLE_STEP_MS    = 3000;           // каждые ~3с
-const VIEWERS_TASK_TIMEOUT = 60_000;      // общий таймаут одной задачи в браузере
+const VIEWERS_TASK_TIMEOUT = 90_000;      // общий таймаут одной задачи в браузере (было 60)
 
 // ——— Браузер
 const VIEWERS_CONCURRENCY = 1;            // держим 1 вкладку одновременно
@@ -53,7 +52,23 @@ const metrics = {
   reconnects: 0,
   viewerTasksStarted: 0, viewerTasksDone: 0, viewerTasksDropped: 0,
   viewerOpenErrors: 0, viewerSelectorMiss: 0,
+  // indicator-specific
+  ind_found_selector: 0,
+  ind_found_text: 0,
+  ind_found_after_reload: 0,
+  ind_timeout: 0,
+  ind_iframe_hits: 0,
+  ind_wait_samples_ms: [],
 };
+
+function pct(arr, p) {
+  if (!arr.length) return 0;
+  const a = [...arr].sort((x,y)=>x-y);
+  const i = Math.min(a.length-1, Math.max(0, Math.floor((p/100)*a.length)-1));
+  return a[i];
+}
+let TASK_SEQ = 0;
+function nextTaskId() { TASK_SEQ = (TASK_SEQ + 1) % 1e9; return TASK_SEQ; }
 
 function log(...a) { console.log(new Date().toISOString(), ...a); }
 
@@ -75,7 +90,7 @@ async function safeGetJson(url) {
         headers: {
           accept: 'application/json, text/plain, */*',
           'cache-control': 'no-cache',
-          'user-agent': 'pumplive-watcher/7.7.0'
+          'user-agent': 'pumplive-watcher/7.8.0'
         }
       });
 
@@ -169,10 +184,7 @@ let viewersActive = 0;
 
 // дедуп по mint на 10 минут
 const recentlyHandled = new Map(); // mint -> timestamp
-
-function markHandled(mint) {
-  recentlyHandled.set(mint, Date.now());
-}
+function markHandled(mint) { recentlyHandled.set(mint, Date.now()); }
 function isRecentlyHandled(mint) {
   const ts = recentlyHandled.get(mint);
   if (!ts) return false;
@@ -187,22 +199,28 @@ function enqueueViewers({ mint, coin, fallbackName = '', fallbackSymbol = '' }) 
   viewersInQueue.add(mint);
 }
 
+/* ================== BROWSER ================== */
+let activePages = 0;
+let lastChromeRssMB = 0;
+
 async function getBrowser() {
   if (browser) return browser;
   const execPath = await chromium.executablePath();
   browser = await puppeteer.launch({
     executablePath: execPath,
-    args: [...chromium.args, '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    args: [
+      ...chromium.args,
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+    ],
     headless: chromium.headless,
-    protocolTimeout: 20_000, // fail-fast, чтобы не висеть надолго
+    protocolTimeout: 60_000, // было 20_000 — мало
   });
   log('✅ Chromium ready:', execPath);
   return browser;
 }
 
-// ——— полезные утилиты для логов ресурсов
-let activePages = 0;
-let lastChromeRssMB = 0;
 async function logResources() {
   try {
     const mem = process.memoryUsage();
@@ -213,20 +231,8 @@ async function logResources() {
     console.log(`[res] cpu_node=${(process.cpuUsage().user/1e6).toFixed(1)}% rss_node=${rssMB}MB heap_node=${heapMB}MB load1=${load1} active_pages=${activePages}${extra}`);
   } catch {}
 }
-function osLoadAvg1() {
-  try { return require('os').loadavg?.()[0]; } catch { return 0; }
-}
-
-// ——— подсчёт Chrome RSS (best effort)
-async function updateChromeRSS() {
-  try {
-    if (!browser) { lastChromeRssMB = 0; return; }
-    const proc = browser.process?.();
-    if (!proc) return;
-    // На Render `process.memoryUsage` для дочернего может быть недоступен.
-    // Поэтому делаем best-effort: ничего не делаем. Оставляем предыдущий lastChromeRssMB.
-  } catch {}
-}
+function osLoadAvg1() { try { return os.loadavg?.()[0]; } catch { return 0; } }
+async function updateChromeRSS() { try { if (!browser) { lastChromeRssMB = 0; return; } const proc = browser.process?.(); if (!proc) return; } catch {} }
 
 async function createPage() {
   const br = await getBrowser();
@@ -237,16 +243,9 @@ async function createPage() {
     await page.setUserAgent(UA);
     await page.setViewport({ width: 1280, height: 800 });
 
-    // блокируем тяжёлое, НО НЕ блокируем stylesheet (вдруг он нужен для появления бейджа)
-    await page.setRequestInterception(true);
-    page.on('request', req => {
-      const t = req.resourceType();
-      if (t === 'image' || t === 'font' || t === 'media') return req.abort();
-      req.continue();
-    });
-
-    // небольшие таймауты по умолчанию
-    page.setDefaultTimeout(15_000);
+    // БОльшие таймауты на операции со страницей
+    page.setDefaultTimeout(30_000);
+    page.setDefaultNavigationTimeout(45_000);
 
     return page;
   } catch (e) {
@@ -265,87 +264,118 @@ async function safeClosePage(page, afterError = false) {
   else            log('🗑 page:closed active_pages=' + activePages);
 }
 
-/* ================== VIEWERS TASK ================== */
-
+/* ================== INDICATOR HUNTER ================== */
 const INDICATOR_SELECTORS = ['#live-indicator', '.live-indicator', '[data-testid="live-indicator"]'];
 
-async function waitIndicatorOrExplain(page, timeoutMs) {
-  // сначала пробуем селекторы
-  const selectorUnion = INDICATOR_SELECTORS.join(',');
-  const found = await page.waitForSelector(selectorUnion, { timeout: timeoutMs }).catch(() => null);
-  if (found) return { ok: true, reason: 'selector', details: null };
-
-  // fallback: текст “LIVE” + цифры
-  const tf = await page.waitForFunction(() => {
-    const txt = document.body?.innerText || '';
-    return /\bLIVE\b/i.test(txt) && /\b\d{1,4}\b/.test(txt);
-  }, { timeout: timeoutMs }).catch(() => null);
-  if (tf) return { ok: true, reason: 'text_fallback', details: null };
-
-  // объясняем, почему не нашли
-  const d = await page.evaluate((selectors) => {
-    const count = (sel) => document.querySelectorAll(sel).length;
-    const ready = document.readyState;
-    const hasNext = !!document.querySelector('#__next');
-    const hasRoot = !!document.querySelector('#root');
-    const iframes = document.querySelectorAll('iframe').length;
-    const txt = (document.body?.innerText || '').slice(0, 5000);
-    const liveTxt = /\bLIVE\b/i.test(txt);
-    const digits = /\b\d{1,4}\b/.test(txt);
-    const counts = selectors.map(s => ({ sel: s, n: count(s) }));
-    const nav = performance.getEntriesByType('navigation')[0];
-    const perf = nav ? {
-      domContentLoaded: Math.round(nav.domContentLoadedEventEnd - nav.startTime),
-      load: Math.round(nav.loadEventEnd - nav.startTime),
-      responseEnd: Math.round(nav.responseEnd - nav.startTime),
-    } : null;
-    return {
-      ready, counts, hasNext, hasRoot, iframes,
-      liveTxt, digits,
-      perf,
-      bodyPreview: (document.body?.outerHTML || '').slice(0, 1200)
-    };
-  }, INDICATOR_SELECTORS);
-
-  const ua = await page.browser().userAgent();
-  const vp = page.viewport();
-
-  log(
-    `[diag] indicator:miss ready=${d.ready} next=${d.hasNext} root=${d.hasRoot} iframes=${d.iframes} ` +
-    `counts=${d.counts.map(c => `${c.sel}:${c.n}`).join('|')} liveTxt=${d.liveTxt} digits=${d.digits} ` +
-    `perf=${d.perf ? JSON.stringify(d.perf) : 'n/a'} ua=${ua} viewport=${vp?.width}x${vp?.height}`
-  );
-  log('[diag] bodyPreview:', d.bodyPreview.replace(/\s+/g, ' ').slice(0, 1000));
-
-  return { ok: false, reason: 'timeout_or_missing', details: d };
+function framePath(f) {
+  const names = [];
+  let cur = f;
+  while (cur) { names.unshift(cur.name() || '(anon)'); cur = cur.parentFrame(); }
+  return names.join(' > ');
+}
+function logFrameTree(page) {
+  try {
+    const frs = page.frames();
+    const info = frs.map(f => {
+      const u = f.url();
+      const trimmed = u.length > 120 ? u.slice(0,120)+'…' : u;
+      return `{name:${f.name()||'-'}, url:${trimmed}}`;
+    }).join(', ');
+    log(`[frames] count=${frs.length} tree=[${info}]`);
+  } catch {}
 }
 
-async function getViewersOnce(page) {
-  // пробуем сначала через live-indicator родителя: span с цифрой
-  const res = await page.evaluate((selectors) => {
-    const root = document.querySelector(selectors.join(',')); // первый попавшийся
-    let num = null;
-    if (root) {
-      const span = root.parentElement?.querySelector('span');
-      if (span) {
-        const txt = (span.textContent || '').trim();
-        const m = txt.match(/\d+/);
+async function waitIndicatorOrExplain(page, timeoutMs, taskId) {
+  const start = Date.now();
+  const deadline = start + timeoutMs;
+
+  // дождаться, пока уйдут блокировки UI
+  await page.waitForFunction(() => getComputedStyle(document.body).pointerEvents !== 'none', { timeout: 15_000 }).catch(()=>{});
+  log(`[ind] t#${taskId} pre-wait: pointerEvents unlocked`);
+  logFrameTree(page);
+
+  const selUnion = INDICATOR_SELECTORS.join(',');
+  while (Date.now() < deadline) {
+    for (const f of page.frames()) {
+      try {
+        const h = await f.$(selUnion);
+        if (h) {
+          const dt = Date.now() - start;
+          const url = f.url();
+          const inIframe = !!f.parentFrame();
+          if (inIframe) metrics.ind_iframe_hits++;
+          metrics.ind_found_selector++;
+          metrics.ind_wait_samples_ms.push(dt);
+          log(`[ind] t#${taskId} found via=selector_any_frame dt=${dt}ms iframe=${inIframe} framePath="${framePath(f)}" frameUrl="${url}");
+          return { ok: true, reason: 'selector_any_frame', frame: f, dt };
+        }
+      } catch {}
+    }
+    await new Promise(r => setTimeout(r, 250));
+  }
+
+  // фолбэк по тексту во всех фреймах
+  for (const f of page.frames()) {
+    try {
+      const ok = await f.evaluate(() => {
+        const txt = (document.body?.innerText || '').trim();
+        return /\bLIVE\b/i.test(txt) && /\b\d{1,4}\b/.test(txt);
+      });
+      if (ok) {
+        const dt = Date.now() - start;
+        metrics.ind_found_text++;
+        metrics.ind_wait_samples_ms.push(dt);
+        log(`[ind] t#${taskId} found via=text_fallback dt=${dt}ms framePath="${framePath(f)}" url="${f.url()}"`);
+        return { ok: true, reason: 'text_fallback_frames', frame: f, dt };
+      }
+    } catch {}
+  }
+
+  // диагностика
+  const counts = [];
+  for (const sel of INDICATOR_SELECTORS) {
+    let sum = 0;
+    for (const f of page.frames()) { try { sum += (await f.$$(sel)).length; } catch {} }
+    counts.push({ sel, n: sum });
+  }
+  const ready = await page.evaluate(() => document.readyState).catch(()=>'unknown');
+  const dt = Date.now() - start;
+  metrics.ind_timeout++;
+  metrics.ind_wait_samples_ms.push(dt);
+  log(`[ind] t#${taskId} MISS dt=${dt}ms ready=${ready} counts=${counts.map(c=>`${c.sel}:${c.n}`).join('|')}`);
+  return { ok: false, reason: 'timeout_or_missing', frame: null, dt };
+}
+
+async function getViewersOnce(page, preferFrame = null) {
+  const tryRead = async (f) => {
+    return await f.evaluate((selectors) => {
+      const root = document.querySelector(selectors.join(','));
+      let num = null;
+      if (root) {
+        const span = root.parentElement?.querySelector('span') || root.querySelector('span');
+        const txt = (span?.textContent || root.textContent || '').trim();
+        const m = txt.match(/\d{1,4}/);
         if (m) num = Number(m[0]);
       }
-    }
-    // fallback: поиск во всём теле
-    if (num === null) {
-      const txt = document.body?.innerText || '';
-      const m2 = txt.match(/\b\d{1,4}\b/);
-      if (m2) num = Number(m2[0]);
-    }
-    return Number.isFinite(num) ? num : null;
-  }, INDICATOR_SELECTORS);
+      if (num === null) {
+        const txt = (document.body?.innerText || '').trim();
+        const m2 = txt.match(/\b\d{1,4}\b/);
+        if (m2) num = Number(m2[0]);
+      }
+      return Number.isFinite(num) ? num : null;
+    }, INDICATOR_SELECTORS);
+  };
 
-  if (!Number.isFinite(res)) return { ok: false, viewers: null, reason: 'not_a_number' };
-  return { ok: true, viewers: res };
+  if (preferFrame) {
+    try { const v = await tryRead(preferFrame); if (Number.isFinite(v)) return { ok: true, viewers: v }; } catch {}
+  }
+  for (const f of page.frames()) {
+    try { const v = await tryRead(f); if (Number.isFinite(v)) return { ok: true, viewers: v }; } catch {}
+  }
+  return { ok: false, viewers: null, reason: 'not_a_number' };
 }
 
+/* ================== VIEWERS TASK ================== */
 async function notifyTelegram(mint, coin, fallbackName, fallbackSymbol, viewers) {
   const socials = extractOfficialSocials(coin);
   const title = `${coin.name || fallbackName} (${coin.symbol || fallbackSymbol})`;
@@ -368,83 +398,77 @@ async function notifyTelegram(mint, coin, fallbackName, fallbackSymbol, viewers)
 }
 
 async function viewersTask({ mint, coin, fallbackName, fallbackSymbol, detectAt }) {
+  const taskId = nextTaskId();
   metrics.viewerTasksStarted++;
   markHandled(mint);
   const t0 = detectAt || Date.now();
-  let page;
+  log(`[task] t#${taskId} start mint=${mint} symbol=${coin?.symbol||fallbackSymbol}`);
 
   // быстрый recheck перед браузером — вдруг уже не live
   const pre = await safeGetJson(`${API}/coins/${mint}`);
   if (!pre || pre?.is_currently_live === false) {
-    log(`⏭️ skip before_browser mint=${mint} reason=already_not_live t_detect→taskStart=${Date.now()-t0}ms`);
+    log(`⏭️ t#${taskId} skip: already_not_live dt=${Date.now()-t0}ms`);
     return;
   }
 
-  const diag = { consoleErrors: [], pageErrors: [], reqFailed: [] };
+  let page;
+  let reloads = 0;
 
   try {
     page = await createPage();
 
-    page.on('console', msg => {
-      if (msg.type() === 'error') diag.consoleErrors.push(msg.text());
-    });
-    page.on('pageerror', err => diag.pageErrors.push(String(err)));
-    page.on('requestfailed', req => {
-      diag.reqFailed.push({
-        url: req.url(),
-        failure: req.failure()?.errorText,
-        method: req.method(),
-        type: req.resourceType()
-      });
-    });
-
     const navStart = Date.now();
-    log(`🌐 goto:start url=https://pump.fun/coin/${mint}`);
-    await page.goto(`https://pump.fun/coin/${mint}`, {
-      waitUntil: 'domcontentloaded',
-      timeout: 25_000
-    });
+    log(`🌐 t#${taskId} goto:start url=https://pump.fun/coin/${mint}`);
+    await page.goto(`https://pump.fun/coin/${mint}`, { waitUntil: 'domcontentloaded', timeout: 45_000 });
+    await new Promise(r => setTimeout(r, 1200)); // догидратация
     const dtNav = Date.now() - navStart;
-    // небольшая пауза для “догидратации”
-    await new Promise(r => setTimeout(r, 1500));
-    log(`🌐 goto:done dt_nav=${dtNav}ms wait_dom_extra=1500ms`);
+    log(`🌐 t#${taskId} goto:done dt_nav=${dtNav}ms`);
 
-    // ждём индикатор (расширенные селекторы, потом текстовый fallback)
-    const indStart = Date.now();
-    const ind = await waitIndicatorOrExplain(page, INDICATOR_WAIT_MS);
-    const dtInd = Date.now() - indStart;
+    let ind = await waitIndicatorOrExplain(page, INDICATOR_WAIT_MS, taskId);
+
     if (!ind.ok) {
-      log(`🔎 live-indicator:found=false dt=${dtInd}ms reason=${ind.reason}`);
-      // ещё раз проверим API — возможно, уже не live, тогда скип сразу
       const again = await safeGetJson(`${API}/coins/${mint}`);
-      if (!again || again?.is_currently_live === false) {
-        await safeClosePage(page);
-        log(`⏭️ skip reason=no_indicator_but_still_live timeline detect→taskStart=${navStart - t0}ms taskStart→navDone=${dtNav}ms navDone→indicatorWait=${dtInd}ms detect→skip=${Date.now()-t0}ms`);
-        return;
+      if (again?.is_currently_live) {
+        reloads++;
+        log(`🔄 t#${taskId} reload#${reloads} API still live; short wait 12s`);
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(()=>{});
+        await page.waitForFunction(() => getComputedStyle(document.body).pointerEvents !== 'none', { timeout: 10_000 }).catch(()=>{});
+        ind = await waitIndicatorOrExplain(page, 12_000, taskId);
+        if (ind.ok) metrics.ind_found_after_reload++;
       }
-      // считаем как miss (селектор не нашли, но API говорит live) — скип
-      metrics.viewerSelectorMiss++;
-      await safeClosePage(page);
-      log(`⏭️ skip reason=no_indicator_and_still_live timeline detect→taskStart=${navStart - t0}ms taskStart→navDone=${dtNav}ms navDone→indicatorWait=${dtInd}ms detect→skip=${Date.now()-t0}ms`);
-      return;
-    } else {
-      log(`🔎 live-indicator:found=true dt=${dtInd}ms via=${ind.reason}`);
     }
 
-    // 3 сэмпла по ~3 секунды
+    if (!ind.ok) {
+      metrics.viewerSelectorMiss++;
+      await safeClosePage(page);
+      log(`⏭️ t#${taskId} no-indicator; nav=${dtNav}ms reloads=${reloads} detect→end=${Date.now()-t0}ms`);
+      return;
+    }
+
+    log(`🔎 t#${taskId} indicator ok via=${ind.reason} dt=${ind.dt}ms reloads=${reloads} iframe=${!!ind.frame?.parentFrame()}`);
+
+    // Теперь включаем interception (ПОСЛЕ того, как нашли индикатор)
+    await page.setRequestInterception(true).catch(()=>{});
+    page.on('request', req => {
+      const t = req.resourceType();
+      if (t === 'image' || t === 'media') return req.abort();
+      // шрифты не режем — иногда от них зависит индикатор
+      req.continue();
+    });
+
+    // 3 сэмпла
     let maxV = -1;
     for (let i = 1; i <= SAMPLE_COUNT; i++) {
-      const s = await getViewersOnce(page);
+      const s = await getViewersOnce(page, ind.frame || null);
       if (!s.ok) {
-        log(`📊 sample i=${i}/${SAMPLE_COUNT} ok=false reason=${s.reason}`);
+        log(`📊 t#${taskId} sample ${i}/${SAMPLE_COUNT} miss reason=${s.reason}`);
       } else {
         maxV = Math.max(maxV, s.viewers);
-        log(`📊 sample i=${i}/${SAMPLE_COUNT} ok=true viewers=${s.viewers}`);
+        log(`📊 t#${taskId} sample ${i}/${SAMPLE_COUNT} viewers=${s.viewers}`);
         if (s.viewers >= VIEWERS_THRESHOLD) {
-          // ранний выход: отправляем TG и закрываем
           await notifyTelegram(mint, coin, fallbackName, fallbackSymbol, s.viewers);
           await safeClosePage(page);
-          log(`✅ threshold:hit viewers=${s.viewers} early=true timeline detect→taskStart=${navStart - t0}ms taskStart→navDone=${dtNav}ms navDone→indicator=${dtInd}ms indicator→samples=${Date.now()-indStart}ms detect→checked=${Date.now()-t0}ms`);
+          log(`✅ t#${taskId} threshold hit v=${s.viewers} total=${Date.now()-t0}ms`);
           metrics.viewerTasksDone++;
           return;
         }
@@ -452,9 +476,8 @@ async function viewersTask({ mint, coin, fallbackName, fallbackSymbol, detectAt 
       if (i < SAMPLE_COUNT) await new Promise(r => setTimeout(r, SAMPLE_STEP_MS));
     }
 
-    // не достигли порога
     await safeClosePage(page);
-    log(`⏭️ threshold:miss max=${maxV<0?'n/a':maxV} timeline detect→taskStart=${navStart - t0}ms taskStart→navDone=${dtNav}ms navDone→indicator=${dtInd}ms indicator→samples=${Date.now()-indStart}ms detect→checked=${Date.now()-t0}ms`);
+    log(`⏭️ t#${taskId} threshold miss max=${maxV<0?'n/a':maxV} total=${Date.now()-t0}ms`);
     metrics.viewerTasksDone++;
   } catch (e) {
     metrics.viewerOpenErrors++;
@@ -499,7 +522,7 @@ async function apiWorkerLoop() {
 
     if (coin.is_currently_live) {
       const socials = extractOfficialSocials(coin);
-      if (socials.length === 0) { inQueue.delete(mint); continue; } // твой фильтр
+      if (socials.length === 0) { inQueue.delete(mint); continue; } // фильтр: без соцсетей не тратим браузер
 
       inQueue.delete(mint);
       enqueueViewers({ mint, coin, fallbackName: name, fallbackSymbol: symbol });
@@ -566,10 +589,18 @@ setInterval(() => {
 }, 60_000);
 
 // ресурсы раз в 15с
-setInterval(async () => {
-  await updateChromeRSS();
-  await logResources();
-}, RES_LOG_EVERY_MS);
+setInterval(async () => { await updateChromeRSS(); await logResources(); }, RES_LOG_EVERY_MS);
+
+// индикаторная сводка каждые 5 минут
+setInterval(() => {
+  const a = metrics.ind_wait_samples_ms;
+  const p50 = pct(a, 50), p90 = pct(a, 90), p99 = pct(a, 99);
+  console.log(
+    `[ind-sum] samples=${a.length} p50=${p50}ms p90=${p90}ms p99=${p99}ms ` +
+    `found_sel=${metrics.ind_found_selector} found_text=${metrics.ind_found_text} ` +
+    `found_after_reload=${metrics.ind_found_after_reload} timeouts=${metrics.ind_timeout} iframe_hits=${metrics.ind_iframe_hits}`
+  );
+}, 300_000);
 
 /* ================== STARTUP/SHUTDOWN ================== */
 log('Worker starting…');
