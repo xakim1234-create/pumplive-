@@ -1,7 +1,7 @@
-// index.js — v9.2.0 (на базе твоего v9.1.0)
+// index.js — v9.3.0
 // API-first, 30s window (6x5s), global RPS throttle,
-// api_null rescue (4 быстрых ретрая), Telegram alerts встроены,
-// recheck "not_live" через 5s в отдельном слабом пуле.
+// api_null rescue (4 быстрых ретрая), Telegram alerts,
+// not_live → обязательный один recheck через 5s (отдельная мягкая очередь).
 // Браузер НЕ используется.
 
 // ===== Imports =====
@@ -15,20 +15,20 @@ const API = process.env.PUMP_API || "https://frontend-api-v3.pump.fun";
 
 // Порог и окно измерения
 const VIEWERS_THRESHOLD   = int("VIEWERS_THRESHOLD", 30);      // >= этого — алёрт
-const MEASURE_WINDOW_MS   = int("MEASURE_WINDOW_MS", 30_000);  // 30s окно (ВАЖНО!)
+const MEASURE_WINDOW_MS   = int("MEASURE_WINDOW_MS", 30_000);  // 30s окно
 const RECHECKS            = int("RECHECKS", 6);                 // 6 проб
 const RECHECK_STEP_MS     = int("RECHECK_STEP_MS", 5_000);      // шаг 5s
 
 // Параллельность и глобальный троттлинг API
-const MAX_CONCURRENCY     = int("MAX_CONCURRENCY", 8);          // до 8 задач
-const RECHECK_CONCURRENCY = int("RECHECK_CONCURRENCY", 2);      // мягкий пул для повторных not_live
+const MAX_CONCURRENCY     = int("MAX_CONCURRENCY", 8);          // основная очередь
+const RECHECK_CONCURRENCY = int("RECHECK_CONCURRENCY", 2);      // мягкая очередь для not_live recheck
 const GLOBAL_RPS          = num("GLOBAL_RPS", 2);                // лимит запросов/сек
 const JITTER_MS           = int("JITTER_MS", 150);               // небольшой джиттер
 
 // Дедупликация: одно и то же mint не тревожим N минут (для входа из WS)
 const DEDUP_TTL_MS        = int("DEDUP_TTL_MS", 10 * 60_000);
 
-// Поведение (оставляем для логов, но логика уже API-only)
+// Поведение (для логов)
 const STRICT_ONE_SHOT     = bool("STRICT_ONE_SHOT", true);
 const API_VIEWERS_ONLY    = bool("API_VIEWERS_ONLY", true);
 
@@ -43,10 +43,10 @@ const NOT_LIVE_RECHECK_MS = int("NOT_LIVE_RECHECK_MS", 5000);   // через 5s
 const HEARTBEAT_MS        = int("HEARTBEAT_MS", 60_000);
 
 // Telegram — либо ENV, либо хардкод ниже
-const TG_TOKEN_HARDCODED  = "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc";
-const TG_CHAT_ID_HARDCODED= "-4857972467";
-const TG_TOKEN            = (process.env.TG_TOKEN || TG_TOKEN_HARDCODED || "").trim();
-const TG_CHAT_ID          = (process.env.TG_CHAT_ID || TG_CHAT_ID_HARDCODED || "").trim();
+const TG_TOKEN_HARDCODED   = "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc";
+const TG_CHAT_ID_HARDCODED = "-4857972467";
+const TG_TOKEN             = (process.env.TG_TOKEN || TG_TOKEN_HARDCODED || "").trim();
+const TG_CHAT_ID           = (process.env.TG_CHAT_ID || TG_CHAT_ID_HARDCODED || "").trim();
 
 // ===== Helpers =====
 function int(name, def) { const v = parseInt(process.env[name] || "", 10); return Number.isFinite(v) ? v : def; }
@@ -64,9 +64,14 @@ const metrics = {
   queued: 0, started: 0, done: 0, alerted: 0,
   dedup_skip: 0, not_live_skip: 0, api_null_skip: 0, threshold_miss: 0,
   api_null_recovered: 0,
+  // Новые для not_live recheck
+  recheck_scheduled: 0,      // сколько поставили задач на recheck
+  recheck_performed: 0,      // сколько реально выполнили recheck
+  rechecked_live: 0,         // сколько на recheck стали live
+  rechecked_skip: 0          // сколько на recheck остались not_live и были скипнуты
 };
 
-// дедуп по mint (только для входа из WS)
+// дедуп по mint (для входа из WS)
 const recently = new Map(); // mint -> ts
 function seenRecently(mint){
   const t = recently.get(mint);
@@ -80,8 +85,9 @@ function markSeen(mint){ recently.set(mint, Date.now()); }
 const mainStack = [];
 let mainActive = 0;
 
-const recheckStack = [];
+const recheckStack = [];        // элементы: { mint, at }
 let recheckActive = 0;
+const recheckPlanned = new Set();// чтобы не ставить повторный recheck на тот же mint
 
 // ===== Global API throttle (RPS + penalty после 429) =====
 let minGapMs = Math.max(50, Math.floor(1000 / Math.max(0.1, GLOBAL_RPS))); // напр. 2 rps => 500ms
@@ -114,7 +120,7 @@ async function fetchCoin(mint, maxRetries=2){
           "accept": "application/json, text/plain, */*",
           "cache-control": "no-cache, no-store",
           "pragma": "no-cache",
-          "user-agent": "pump-watcher/9.2.0"
+          "user-agent": "pump-watcher/9.3.0"
         }
       });
       if (r.status === 429){
@@ -216,7 +222,13 @@ async function measureWindow(mint){
 function pushMain(task){ mainStack.push(task); metrics.queued++; }
 function popMain(){ return mainStack.pop(); }
 
-function pushRecheck(task){ recheckStack.push(task); } // повторные not_live
+function scheduleRecheck(mint){
+  if (recheckPlanned.has(mint)) return;                // уже стоит
+  recheckPlanned.add(mint);
+  recheckStack.push({ mint, at: Date.now() + NOT_LIVE_RECHECK_MS });
+  metrics.recheck_scheduled++;
+  log(`skip: not_live initial | mint=${mint} → recheck in ${NOT_LIVE_RECHECK_MS}ms`);
+}
 
 async function mainWorker(){
   while (true){
@@ -232,9 +244,7 @@ async function mainWorker(){
 
         // --- Первичный fetch (one-shot) + rescue при api_null ---
         let coin = await fetchCoin(mint, 2);
-        let firstWasNull = false;
         if (!coin){
-          firstWasNull = true;
           for (let i=1; i<=API_NULL_RETRIES; i++){
             log(`api_null → retry ${i}/${API_NULL_RETRIES} | ${mint}`);
             await sleep(API_NULL_STEP_MS);
@@ -248,15 +258,13 @@ async function mainWorker(){
           }
         }
 
-        // --- Если не live — поставим мягкую перепроверку через 5s ---
+        // --- Если не live — ставим мягкую перепроверку через 5s и выходим ---
         if (coin.is_currently_live !== true){
-          metrics.not_live_skip++;
-          log("skip: not_live", mint);
-          pushRecheck({ mint, at: Date.now() + NOT_LIVE_RECHECK_MS });
+          scheduleRecheck(mint);
           return;
         }
 
-        // --- ВАЖНО: НЕ скипаем без соцсетей — пусть тоже идут на измерение ---
+        // --- Не фильтруем по соцсетям — любые live измеряем ---
         const res = await measureWindow(mint);
         if (res.ok){
           await alertLive(mint, coin, res.viewers, res.source);
@@ -277,7 +285,7 @@ async function mainWorker(){
 async function recheckWorker(){
   while (true){
     if (recheckActive >= RECHECK_CONCURRENCY || recheckStack.length === 0){ await sleep(100); continue; }
-    // выбираем задачу, срок которой уже настал
+    // берём задачу, у которой наступило время
     let idx = -1;
     const now = Date.now();
     for (let i=0; i<recheckStack.length; i++){
@@ -290,12 +298,20 @@ async function recheckWorker(){
     (async () => {
       try{
         const { mint } = job;
-        // повторный fetch и, если live — обычное измерение
+        metrics.recheck_performed++;
+        log(`recheck: run | mint=${mint}`);
+
         const coin = await fetchCoin(mint, 2);
+        recheckPlanned.delete(mint);
+
         if (!coin || coin.is_currently_live !== true){
-          // всё ещё не live — молча уходим
+          metrics.rechecked_skip++;
+          log(`recheck: still_not_live | mint=${mint}`);
           return;
         }
+
+        metrics.rechecked_live++;
+        log(`recheck: became_live → measuring | mint=${mint}`);
         const res = await measureWindow(mint);
         if (res.ok){
           await alertLive(mint, coin, res.viewers, res.source);
@@ -327,10 +343,11 @@ function connectWS(){
     if (seenRecently(mint)){ metrics.dedup_skip++; return; }
     markSeen(mint);
 
-    // Можно раскомментить, если хочешь видеть сырой поток
+    // Можно раскомментить для диагностики сырого потока:
     // log("ws:new token | mint=", mint, "| name=", msg?.name || msg?.tokenName || "", "| symbol=", msg?.symbol || msg?.ticker || "");
 
-    pushMain({ mint });
+    metrics.queued++;
+    mainStack.push({ mint });
   });
   ws.on("close", () => { log("WS closed → reconnect in 5s"); setTimeout(connectWS, 5000); });
   ws.on("error", (e) => { log("WS error:", e.message); });
@@ -339,7 +356,6 @@ function connectWS(){
 // ===== Heartbeat =====
 setInterval(() => {
   const secSinceWs = lastWsMsgAt ? Math.round((Date.now()-lastWsMsgAt)/1000) : -1;
-  const totalSkip = metrics.dedup_skip + metrics.not_live_skip + metrics.api_null_skip + metrics.threshold_miss;
   const apiNullPct = metrics.api_req ? ((metrics.api_null_skip / Math.max(1, metrics.api_req)) * 100).toFixed(1) : "0.0";
   log(
     "[stats]",
@@ -358,10 +374,12 @@ setInterval(() => {
     "done="+metrics.done,
     "alerted="+metrics.alerted,
     "| skip:dedup="+metrics.dedup_skip,
-    "not_live="+metrics.not_live_skip,
     "api_null="+metrics.api_null_skip+`(${apiNullPct}%)`,
     "miss="+metrics.threshold_miss,
-    "| rescued:api_null="+metrics.api_null_recovered
+    "| recheck: scheduled="+metrics.recheck_scheduled,
+    "performed="+metrics.recheck_performed,
+    "promoted="+metrics.rechecked_live,
+    "final_skip="+metrics.rechecked_skip
   );
 }, HEARTBEAT_MS);
 
