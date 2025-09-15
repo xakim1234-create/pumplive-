@@ -1,127 +1,99 @@
-// index.js — minimal live-catcher with safe fetch + retries
-import WebSocket from "ws";
-import { setTimeout as sleep } from "timers/promises";
-import fetch from "undici";
+// ==== настройки быстрой верификации ====
+const DEBOUNCE_MS_MIN = 900;     // первое ожидание после WS
+const DEBOUNCE_MS_MAX = 1200;
+const QUICK_RECHECKS = 6;        // сколько быстрых повторов
+const QUICK_STEP_MS   = 500;     // шаг между повторами
 
-// ---------- Config ----------
-const WS_URL = "wss://pumpportal.fun/api/data";
-const API    = "https://frontend-api-v3.pump.fun";
-const GLOBAL_RPS = 3;                 // ~3 запроса/сек — достаточно
-const MAX_RETRIES = 4;                // ретраи при пустом/битом JSON
-const RETRY_STEP_MS = 800;            // пауза между ретраями
-const JITTER_MS = 150;                // небольшой джиттер к RPS
-const VIEWERS_THRESHOLD = 1;          // просто увидеть лайв (можешь поднять позже)
+// кэш, чтобы одну монету не проверять параллельно
+const pending = new Set();
 
-// ---------- Throttle ----------
-let nextAllowedAt = 0;
-let penaltyUntil = 0; // после 429 замедляемся
-const minGapMs = Math.max(50, Math.floor(1000 / Math.max(0.1, GLOBAL_RPS)));
-
-async function throttle() {
-  const now = Date.now();
-  const gap = now < penaltyUntil ? Math.max(minGapMs, 1000) : minGapMs;
-  if (now < nextAllowedAt) await sleep(nextAllowedAt - now);
-  const jitter = Math.max(-JITTER_MS, Math.min(JITTER_MS, (Math.random() * 2 - 1) * JITTER_MS));
-  nextAllowedAt = Date.now() + gap + jitter;
-}
-
-// ---------- Safe fetch ----------
-function coinUrl(mint) {
-  // кэш-бастер снижает шанс пустого тела
-  return `${API}/coins/${mint}?_=${Date.now()}`;
-}
-
-async function fetchCoin(mint) {
-  const url = coinUrl(mint);
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+// аккуратный фетч с no-cache и ретраями на пустой ответ
+async function fetchCoinSafe(mint, retries = 2) {
+  const url = `${API}/coins/${mint}?_=${Date.now()}`;
+  for (let i = 0; i <= retries; i++) {
     try {
-      await throttle();
-      const r = await fetch.fetch(url, {
+      const r = await fetch(url, {
         headers: {
           "accept": "application/json, text/plain, */*",
           "cache-control": "no-cache, no-store",
           "pragma": "no-cache",
-          "user-agent": "pumplive/mini-1.0"
+          "user-agent": "live-sniffer/mini"
         }
       });
-
-      if (r.status === 429) {
-        // замедляемся на 30с
-        penaltyUntil = Date.now() + 30_000;
-        console.warn("⚠️ 429 from API → slow mode 30s");
-        await sleep(1500 + Math.random() * 1000);
-        continue;
-      }
-      if (!r.ok) {
-        throw new Error(`HTTP ${r.status}`);
-      }
-
       const text = await r.text();
-      if (!text || !text.trim()) {
-        throw new Error("empty-body");
-      }
-
-      let json;
-      try { json = JSON.parse(text); }
-      catch { throw new Error("bad-json"); }
-
-      return json;
+      if (!text || !text.trim()) throw new Error("empty-body");
+      return JSON.parse(text);
     } catch (e) {
-      if (attempt < MAX_RETRIES) {
-        await sleep(RETRY_STEP_MS * (attempt + 1));
+      if (i < retries) {
+        await new Promise(res => setTimeout(res, 350 + i * 200));
         continue;
       }
-      console.error(`❌ fetch error: ${e.message} | mint: ${mint}`);
-      return null;
+      throw e;
     }
   }
 }
 
-// ---------- Helpers ----------
-function now() { return new Date().toISOString(); }
-function fmt(n) { try { return Number(n).toLocaleString("en-US"); } catch { return String(n); } }
-function inferLive(c) {
-  const isLive = c?.is_currently_live === true;
-  const viewers = typeof c?.num_participants === "number" ? c.num_participants : null;
-  const inferred = isLive || (typeof viewers === "number" && viewers >= VIEWERS_THRESHOLD);
-  return { inferred, isLive, viewers };
+// быстрая проверка лайва (дебаунс + несколько проб)
+async function confirmLive(mint, tokenFrom = "ws") {
+  if (pending.has(mint)) return;
+  pending.add(mint);
+
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const debounce = Math.floor(DEBOUNCE_MS_MIN + Math.random() * (DEBOUNCE_MS_MAX - DEBOUNCE_MS_MIN));
+  await sleep(debounce);
+
+  let lastErr = null;
+  for (let i = 0; i <= QUICK_RECHECKS; i++) {
+    try {
+      const c = await fetchCoinSafe(mint, 2);
+      const live = c?.is_currently_live === true;
+      const viewers = (typeof c?.num_participants === "number") ? c.num_participants : "n/a";
+
+      if (live) {
+        console.log(new Date().toISOString(),
+          `🔥 LIVE | ${mint} | ${(c?.symbol || "").toString()} (${(c?.name || "").toString()}) | viewers=${viewers} | is_currently_live=true`
+        );
+        pending.delete(mint);
+        return;
+      }
+
+      // не лайв — если это не последняя попытка, ждём и повторяем
+      if (i < QUICK_RECHECKS) {
+        await sleep(QUICK_STEP_MS);
+        continue;
+      }
+
+      // последняя попытка и всё ещё false — логируем not live
+      console.log(new Date().toISOString(),
+        `… not live | ${mint} | viewers=${viewers} | is_currently_live=false`
+      );
+      pending.delete(mint);
+      return;
+
+    } catch (e) {
+      lastErr = e;
+      // сеть/пустое тело — ещё попытка, если есть
+      if (i < QUICK_RECHECKS) {
+        await sleep(QUICK_STEP_MS);
+        continue;
+      }
+      console.log(`❌ fetch error: ${e.message} | mint: ${mint}`);
+      pending.delete(mint);
+      return;
+    }
+  }
+
+  // на всякий случай
+  if (pending.has(mint)) pending.delete(mint);
 }
 
-// ---------- WS ----------
-const ws = new WebSocket(WS_URL);
-
-ws.on("open", () => {
-  console.log("✅ WS connected:", WS_URL);
-  ws.send(JSON.stringify({ method: "subscribeNewToken" }));
-  console.log("📡 Subscribed: subscribeNewToken");
+// === в твоём ws.on("message") просто вызывай confirmLive ===
+// ...
+ws.on("message", (raw) => {
+  try {
+    const msg = JSON.parse(raw.toString());
+    const mint = msg?.mint || msg?.tokenMint || msg?.ca || null;
+    if (!mint) return;
+    confirmLive(mint, "ws");
+  } catch {}
 });
-
-ws.on("message", async (raw) => {
-  let msg;
-  try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-  const mint =
-    msg?.mint || msg?.tokenMint || msg?.ca || msg?.address || msg?.mintAddress || null;
-
-  if (!mint) return;
-
-  // тянем coin
-  const c = await fetchCoin(mint);
-  if (!c) return;
-
-  const { inferred, isLive, viewers } = inferLive(c);
-
-  if (inferred) {
-    console.log(
-      `${now()} 🔥 LIVE | ${mint} | ${c?.symbol || ""} ${c?.name ? `(${c.name})` : ""}`.trim(),
-      `| viewers=${viewers ?? "n/a"} | is_currently_live=${isLive}`
-    );
-  } else {
-    console.log(
-      `${now()} … not live | ${mint} | viewers=${viewers ?? "n/a"} | is_currently_live=${isLive}`
-    );
-  }
-});
-
-ws.on("close", () => console.log("❌ WS closed"));
-ws.on("error", (e) => console.error("WS error:", e?.message ?? e));
