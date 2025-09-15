@@ -1,15 +1,13 @@
 {
   "name": "pump-watcher",
-  "version": "8.1.0",
+  "version": "9.0.0",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@sparticuz/chromium": "^126.0.0",
     "node-fetch": "^3.3.2",
-    "puppeteer-core": "^22.15.0",
     "ws": "^8.18.0"
   }
 }
