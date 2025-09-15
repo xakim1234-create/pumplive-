@@ -1,4 +1,4 @@
-// index.js — v3.9 + Telegram notify + Axiom /t/{mint}
+// index.js — v4.0 + Telegram photo notify
 import WebSocket from "ws";
 import fetch from "node-fetch";
 
@@ -52,7 +52,7 @@ async function safeGetJson(url) {
         headers: {
           accept: "application/json, text/plain, */*",
           "cache-control": "no-cache",
-          "user-agent": "pumplive-watcher/3.9"
+          "user-agent": "pumplive-watcher/4.0"
         }
       });
       if (r.status === 429) {
@@ -95,20 +95,34 @@ function extractOfficialSocials(coin) {
   return socials;
 }
 
-// ——— Telegram
-async function sendTG(text) {
+// ——— Telegram send
+async function sendTG({ text, photo }) {
   if (!TG_TOKEN || !TG_CHAT_ID) return;
   try {
-    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TG_CHAT_ID,
-        text,
-        parse_mode: "HTML",
-        disable_web_page_preview: false
-      })
-    });
+    if (photo) {
+      // отправляем картинку с подписью
+      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendPhoto`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: TG_CHAT_ID,
+          photo,
+          caption: text,
+          parse_mode: "HTML"
+        })
+      });
+    } else {
+      // fallback на текст
+      await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: TG_CHAT_ID,
+          text,
+          parse_mode: "HTML"
+        })
+      });
+    }
   } catch (e) {
     log("⚠️  telegram send error:", e.message);
   }
@@ -161,8 +175,10 @@ function startLiveWatch(mint, name = "", symbol = "") {
           socials.join("\n")
         ].join("\n");
 
+        const photoUrl = coin?.image_uri || null;
+
         log("📤 sending to Telegram…");
-        sendTG(msg).then(() => {
+        sendTG({ text: msg, photo: photoUrl }).then(() => {
           log("✅ sent to Telegram");
         }).catch(e => {
           log("⚠️ TG error:", e.message);
