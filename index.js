@@ -277,12 +277,27 @@ function pickInstagram(coin){
 function buildCaption(coin, j, elig){
   const name = coin?.name || ""; const symbol = coin?.symbol || "";
   const title = `${name}${symbol ? ` (${symbol})` : ""}` || "Live on pump.fun";
+
   const line1 = `🟢 <b>LIVE ≥${ELIG_THRESHOLD}</b> | ${escapeHtml(title)}`;
   const lineTs = `🕒 <b>${fmtDateTime(now())}</b>`;
 
-  const mint  = `🧬 Mint (CA):\n<code>${j.mint}</code>`;
-  const tick  = (elig?.tickIndex && elig?.totalTicks)
-    ? `🎯 Tick: <b>${elig.tickIndex}/${elig.totalTicks}</b>` : null;
+  const mint = `🧬 Mint (CA):\n<code>${j.mint}</code>`;
+  const tick = `🎯 Tick: ${j.eligTickIndex}/${j.eligTotalTicks}`;
+  const viewersLine = `👁️ Viewers: <b>${fmtNum(elig.peak)}</b> (peak in ${Math.floor(ELIG_WINDOW_MS/1000)}s)`;
+
+  const latLine = `⏱️ <b>+${fmtDur(j.liveAt - j.t0)}</b> от WS → LIVE, <b>+${fmtDur(elig.hitAt - j.liveAt)}</b> от LIVE → ≥${ELIG_THRESHOLD}`;
+
+  const axiom = `🔗 Axiom:\nhttps://axiom.trade/t/${j.mint}`;
+  const pump  = `💠 Pump.fun:\nhttps://pump.fun/coin/${j.mint}`;
+
+  const lines = [line1, lineTs, mint, tick, viewersLine, latLine, axiom, pump];
+
+  const www = pickWebsite(coin); if (www) lines.push(`🌐 Website: ${www}`);
+  const ig = pickInstagram(coin); if (ig) lines.push(`📸 Instagram: ${ig}`);
+  const tw = pickTwitter(coin); if (tw) lines.push(`🐦 Twitter: ${tw}`);
+
+  return lines.join("\n");
+}
 
   // MCAP (если есть)
   const mcap = extractMcap(coin);
