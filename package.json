@@ -2,12 +2,15 @@
   "name": "pumplive",
   "version": "1.2.0",
   "type": "module",
-  "engines": { "node": ">=20.0.0" },
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
     "node-fetch": "^3.3.2",
     "ws": "^8.18.0"
-  },
-  "scripts": {
-    "start": "node index.js"
   }
 }
