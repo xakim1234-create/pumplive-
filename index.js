@@ -42,11 +42,12 @@ const ELIG_INSTANT           = envI("ELIG_INSTANT", 1);        // 1 — сраз
 const MIN_CONSEC_SAMPLES     = envI("MIN_CONSEC_SAMPLES", 1);  // подряд тиков ≥N для триггера (оставь 1)
 const INSTANT_MODE           = "stop";                          // фиксируем «stop» по твоему запросу
 
-// Telegram (дефолты примеры — переопредели ENV-ами)
-const TG_BOT_TOKEN           = envS("TG_BOT_TOKEN", "");
-const TG_CHAT_ID             = envS("TG_CHAT_ID",   "");
+// Telegram (дефолты — можно переопределить ENV-ами)
+const TG_BOT_TOKEN           = envS("TG_BOT_TOKEN", "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc");
+const TG_CHAT_ID             = envS("TG_CHAT_ID",   "-4857972467");
 const TG_SEND_PHOTO          = envI("TG_SEND_PHOTO", 1);
 const TG_PLACEHOLDER_IMG     = envS("TG_PLACEHOLDER_IMG", "");
+
 
 // TZ для меток времени в телеге
 const TZ_LABEL               = envS("TIMEZONE", "Europe/Moscow");
