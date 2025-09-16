@@ -18,7 +18,7 @@ const SECOND_CHECK_DELAY_MS  = envI("SECOND_CHECK_DELAY_MS", 10000);
 const THIRD_CHECK_DELAY_MS   = envI("THIRD_CHECK_DELAY_MS",  15000);
 const FINAL_CHECK_DELAY_MS   = envI("FINAL_CHECK_DELAY_MS",  45000); // безусловный финал
 
-const QUICK_ATTEMPTS         = envI("QUICK_ATTEMPTS", 3);     // попыток в каждом слоте
+const QUICK_ATTEMPTS         = envI("QUICK_ATTEMPTS", 2);     // попыток в каждом слоте
 const QUICK_STEP_MS          = envI("QUICK_STEP_MS", 700);    // пауза между попытками
 
 const GLOBAL_RPS             = envN("GLOBAL_RPS", 3);         // общий рейт-лимит
