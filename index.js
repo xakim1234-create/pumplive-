@@ -29,12 +29,13 @@ const ELIG_WINDOW_MS        = envI("ELIG_WINDOW_MS", 30000);
 const ELIG_STEP_MS          = envI("ELIG_STEP_MS", 3000);
 
 // Instant send mode
-const ELIG_INSTANT          = envI("ELIG_INSTANT", 1);  // 1 = on
-const MIN_CONSEC_SAMPLES    = envI("MIN_CONSEC_SAMPLES", 2);
+const ELIG_INSTANT          = envI("ELIG_INSTANT", 1);   // 1 = on
+const MIN_CONSEC_SAMPLES    = envI("MIN_CONSEC_SAMPLES", 1); // сразу, без ожиданий
 
-// Anti-spike (ignore one-tick rockets from below threshold)
-const SPIKE_RATIO           = envN("SPIKE_RATIO", 2.0);  // current >= prev * ratio
-const SPIKE_MIN_ABS         = envI("SPIKE_MIN_ABS", 6);  // and current - prev >= this
+// Anti-spike (по умолчанию ВЫКЛЮЧЕН)
+const SPIKE_GUARD           = envI("SPIKE_GUARD", 0); // 1=включить анти-спайк
+const SPIKE_RATIO           = envN("SPIKE_RATIO", 2.0);
+const SPIKE_MIN_ABS         = envI("SPIKE_MIN_ABS", 6);
 
 // Rate limit
 const GLOBAL_RPS            = envN("GLOBAL_RPS", 3);
@@ -73,11 +74,12 @@ function fmtDateTime(ts){
 const caShort = (mint) => (!mint || mint.length < 8) ? (mint || "n/a") : `${mint.slice(0,4)}...${mint.slice(-4)}`;
 const escapeHtml = (s) => String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 
-// Pump.fun URL + money/mcap helpers
-function pumpUrl(mint){ return `https://pump.fun/coin/${encodeURIComponent(mint)}`; }
+// Pump.fun URL + money helpers
+const pumpUrl = (mint) => `https://pump.fun/coin/${encodeURIComponent(mint)}`;
 function fmtMoney(n){
   if (n == null || !Number.isFinite(Number(n))) return null;
   n = Number(n);
+  if (n >= 1e12) return `$${(n/1e12).toFixed(2)}T`;
   if (n >= 1e9)  return `$${(n/1e9).toFixed(2)}B`;
   if (n >= 1e6)  return `$${(n/1e6).toFixed(2)}M`;
   if (n >= 1e3)  return `$${(n/1e3).toFixed(1)}k`;
@@ -85,7 +87,7 @@ function fmtMoney(n){
 }
 function extractMcap(c){
   const cand = [
-    c?.market_cap, c?.marketcap, c?.marketCap,
+    c?.usd_market_cap, c?.market_cap, c?.marketcap, c?.marketCap,
     c?.fdv, c?.fdv_usd, c?.fully_diluted_valuation,
     c?.market_data?.market_cap_usd
   ];
@@ -98,6 +100,10 @@ function extractMcap(c){
   if (Number.isFinite(price) && Number.isFinite(supply)) return price * supply;
   return null;
 }
+const extractAthMcap = (c) => {
+  const n = Number(c?.ath_market_cap);
+  return Number.isFinite(n) && n > 0 ? n : null;
+};
 
 /* ================== METRICS ================== */
 const metrics = {
@@ -268,32 +274,36 @@ function pickInstagram(coin){
   return null;
 }
 
-// Caption with Pump.fun URL + MCAP + Tick X/Y
+/* ========= TG caption with Tick, Pump.fun, MCAP & ATH ========= */
 function buildCaption(coin, j, elig){
   const name = coin?.name || ""; const symbol = coin?.symbol || "";
   const title = `${name}${symbol ? ` (${symbol})` : ""}` || "Live on pump.fun";
 
+  const tickIdx = elig?.tickIndex ?? j.eligTickIndex;
+  const tickTot = elig?.totalTicks ?? j.eligTotalTicks;
+
+  const mcapVal = extractMcap(coin);
+  const athVal  = extractAthMcap(coin);
+  const mcapLine = mcapVal ? `💰 MCAP: <b>${fmtMoney(mcapVal)}</b>` : null;
+  const athLine  = athVal  ? `📈 ATH MCAP: <b>${fmtMoney(athVal)}</b>` : null;
+
   const line1 = `🟢 <b>LIVE ≥${ELIG_THRESHOLD}</b> | ${escapeHtml(title)}`;
   const lineTs = `🕒 <b>${fmtDateTime(now())}</b>`;
-
   const mint = `🧬 Mint (CA):\n<code>${j.mint}</code>`;
-  const tick = `🎯 Tick: ${j.eligTickIndex}/${j.eligTotalTicks}`;
-  const viewersLine = `👁️ Viewers: <b>${fmtNum(elig.peak)}</b> (peak in ${Math.floor(ELIG_WINDOW_MS/1000)}s)`;
-  const latLine = `⏱️ <b>+${fmtDur(j.liveAt - j.t0)}</b> от WS → LIVE, <b>+${fmtDur(elig.hitAt - j.liveAt)}</b> от LIVE → ≥${ELIG_THRESHOLD}`;
-
-  const mcap = extractMcap(coin);
-  const mcapLine = mcap ? `💰 MCAP: <b>${fmtMoney(mcap)}</b>` : null;
-
+  const tick = `🎯 Tick: ${tickIdx}/${tickTot}`;
+  const viewersLine = `👁️ Viewers: <b>${fmtNum(elig?.peak)}</b> (peak in ${Math.floor(ELIG_WINDOW_MS/1000)}s)`;
+  const latLine = `⏱️ <b>+${fmtDur(j.liveAt - j.t0)}</b> от WS → LIVE, <b>+${fmtDur((elig?.hitAt ?? now()) - j.liveAt)}</b> от LIVE → ≥${ELIG_THRESHOLD}`;
   const axiom = `🔗 Axiom:\nhttps://axiom.trade/t/${j.mint}`;
   const pump  = `💠 Pump.fun:\n${pumpUrl(j.mint)}`;
 
   const lines = [line1, lineTs, mint];
   if (mcapLine) lines.push(mcapLine);
+  if (athLine)  lines.push(athLine);
   lines.push(tick, viewersLine, latLine, axiom, pump);
 
   const www = pickWebsite(coin); if (www) lines.push(`🌐 Website: ${www}`);
-  const ig  = pickInstagram(coin); if (ig) lines.push(`📸 Instagram: ${ig}`);
-  const tw  = pickTwitter(coin);   if (tw) lines.push(`🐦 Twitter: ${tw}`);
+  const ig  = pickInstagram(coin); if (ig)  lines.push(`📸 Instagram: ${ig}`);
+  const tw  = pickTwitter(coin);   if (tw)  lines.push(`🐦 Twitter: ${tw}`);
 
   return lines.join("\n");
 }
@@ -309,7 +319,7 @@ function newJob(mint){
     // live
     liveHit: false,
     liveAt: null,
-    viewerSrc: null,
+    viewerSrc: null, // "ls.numParticipants" | "coin.viewers" | "coin.flag"
     // elig
     eligStarted: false,
     eligDone: false,
@@ -346,7 +356,7 @@ function startEligibility(j, coin){
   log(`🎯 ELIG start ${Math.floor(ELIG_WINDOW_MS/1000)}s | ca=${caShort(j.mint)} | thr=${ELIG_THRESHOLD} | step=${Math.floor(ELIG_STEP_MS/1000)}s | ticks=${j.eligTotalTicks}`);
 
   const instantSendAndStop = async () => {
-    const res = { peak: j.eligPeak, hitAt: j.eligHitAt };
+    const res = { peak: j.eligPeak, hitAt: j.eligHitAt, tickIndex: j.eligTickIndex, totalTicks: j.eligTotalTicks };
     pushLat(metrics.lat_live, j.liveAt - j.t0);
     pushLat(metrics.lat_elig, j.eligHitAt - j.liveAt);
     metrics.elig.ok++;
@@ -364,19 +374,21 @@ function startEligibility(j, coin){
     const step = Math.max(1, ELIG_STEP_MS);
     let viewers = null, src = "n/a", httpCode = 0, spike = false;
 
+    // Prefer livestream-api
     const rls = await fetchLs(j.mint);
     if (rls.ok){
       const dec = decideFromLs(rls.data);
       src = dec.src; httpCode = rls.status || 200;
       if (dec.state === "live"){ viewers = asNum(dec.viewers); }
     } else {
+      // fallback coins
       const rc = await fetchCoin(j.mint);
       if (rc.ok){
         const dc = decideFromCoin(rc.data);
         src = dc.src; httpCode = rc.status || 200;
         if (dc.state === "live"){ viewers = asNum(dc.viewers) ?? 0; }
       } else {
-        src = `${rls.kind || rc.kind || 'err'}`; httpCode = rls.status || rc.status || 0;
+        src = `${rls.kind || 'err'}`; httpCode = rls.status || 0;
       }
     }
 
@@ -386,11 +398,11 @@ function startEligibility(j, coin){
     if (viewers !== null){
       j.eligPeak = Math.max(j.eligPeak, viewers);
       const prev = j.lastViewers;
-      if (prev != null && prev < ELIG_THRESHOLD && viewers >= ELIG_THRESHOLD){
+      if (SPIKE_GUARD && prev != null && prev < ELIG_THRESHOLD && viewers >= ELIG_THRESHOLD){
         const bigJump = (viewers >= prev * SPIKE_RATIO) && ((viewers - prev) >= SPIKE_MIN_ABS);
         if (bigJump) spike = true;
       }
-      if (!spike && viewers >= ELIG_THRESHOLD){
+      if ((!spike) && viewers >= ELIG_THRESHOLD){
         j.eligOkSamples++; j.eligConsecOk++; if (!j.eligHitAt) j.eligHitAt = now();
       } else if (!spike) {
         j.eligConsecOk = 0;
@@ -401,14 +413,16 @@ function startEligibility(j, coin){
     log(`⏱️ stabilize ${j.eligTickIndex}/${j.eligTotalTicks} | ca=${caShort(j.mint)} | viewers=${viewers ?? 'n/a'} | src=${src} (${httpCode||'?'}) | ok=${j.eligOkSamples} | consec=${j.eligConsecOk}${sp}`);
     j.lastViewers = (viewers !== null) ? viewers : j.lastViewers;
 
+    // INSTANT
     if (ELIG_INSTANT && j.eligConsecOk >= MIN_CONSEC_SAMPLES){ j.eligDone = true; await instantSendAndStop(); return; }
 
+    // Continue or finalize
     if (now() < windowEnd && j.eligTickIndex < j.eligTotalTicks){
       schedule(j, "elig-tick", now() + step, () => tick());
     } else {
       j.eligDone = true;
       if (j.eligHitAt){
-        const res = { peak: j.eligPeak, hitAt: j.eligHitAt };
+        const res = { peak: j.eligPeak, hitAt: j.eligHitAt, tickIndex: j.eligTickIndex, totalTicks: j.eligTotalTicks };
         pushLat(metrics.lat_live, j.liveAt - j.t0);
         pushLat(metrics.lat_elig, j.eligHitAt - j.liveAt);
         metrics.elig.ok++;
@@ -426,12 +440,14 @@ function startEligibility(j, coin){
     }
   };
 
+  // first tick immediately
   schedule(j, "elig-tick", now() + 1, () => tick());
 }
 
 /* ================== STAGES / PROBES ================== */
 async function slotProbe(j, label){
   for (let i=0; i<QUICK_ATTEMPTS; i++){
+    // 1) livestream first
     const rls = await fetchLs(j.mint);
     if (rls.ok){
       const dec = decideFromLs(rls.data);
@@ -440,6 +456,7 @@ async function slotProbe(j, label){
         j.liveHit = true; startEligibility(j, null); return;
       }
     }
+    // 2) fallback coins
     const rc = await fetchCoin(j.mint);
     if (rc.ok){
       const dec = decideFromCoin(rc.data);
@@ -533,6 +550,7 @@ log("Zero-miss watcher starting…",
   "| RPS=", GLOBAL_RPS,
   "| ELIG=", `≥${ELIG_THRESHOLD} for ${Math.floor(ELIG_WINDOW_MS/1000)}s step ${Math.floor(ELIG_STEP_MS/1000)}s`,
   "| INSTANT=", ELIG_INSTANT ? `on (minConsec=${MIN_CONSEC_SAMPLES})` : "off",
+  "| SPIKE_GUARD=", SPIKE_GUARD ? `on (ratio=${SPIKE_RATIO}, minAbs=${SPIKE_MIN_ABS})` : "off",
   "| TZ=", TZ_LABEL,
   "| no-304 on livestream"
 );
