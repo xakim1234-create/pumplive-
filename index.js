@@ -30,11 +30,12 @@ const ELIG_STEP_MS          = envI("ELIG_STEP_MS", 3000);
 
 // Instant send mode
 const ELIG_INSTANT          = envI("ELIG_INSTANT", 1);  // 1 = on
-const MIN_CONSEC_SAMPLES    = envI("MIN_CONSEC_SAMPLES", 2);
+const MIN_CONSEC_SAMPLES    = envI("MIN_CONSEC_SAMPLES", 1); // <-- по умолчанию 1 (моментально)
 
-// Anti-spike (ignore one-tick rockets from below threshold)
-const SPIKE_RATIO           = envN("SPIKE_RATIO", 2.0);  // current >= prev * ratio
-const SPIKE_MIN_ABS         = envI("SPIKE_MIN_ABS", 6);  // and current - prev >= this
+// Spike diagnostics (не блокирует instant, если SPIKE_BLOCK=0)
+const SPIKE_RATIO           = envN("SPIKE_RATIO", 2.0);
+const SPIKE_MIN_ABS         = envI("SPIKE_MIN_ABS", 6);
+const SPIKE_BLOCK           = envI("SPIKE_BLOCK", 0); // 0 = не блокируем instant, 1 = блокируем как раньше
 
 // Rate limit
 const GLOBAL_RPS            = envN("GLOBAL_RPS", 3);
@@ -42,7 +43,7 @@ const JITTER_MS             = envI("JITTER_MS", 120);
 const PENALTY_AFTER_429_MS  = envI("PENALTY_AFTER_429_MS", 90000);
 
 // WS dedup / bumps
-const DEDUP_TTL_MS          = envI("DEDUP_TTL_MS", 600000);
+const DEDUP_TTL_MS          = envI("DEDUP_TTL_MS", 600000); // 10 мин общий дедуп
 const WS_BUMP_WINDOW_MS     = envI("WS_BUMP_WINDOW_MS", 15000);
 
 // Heartbeat
@@ -125,7 +126,7 @@ async function fetchCoin(mint){
 }
 
 async function fetchLs(mint){
-  // Always force 200 body (no If-None-Match / If-Modified-Since); add cache-buster
+  // no-cache, чтобы не получать 304 (хотя трактуем их как "нет нового")
   const url = `${API_LS}/livestream?mintId=${encodeURIComponent(mint)}&_=${Date.now()}&n=${Math.random().toString(36).slice(2,8)}`;
   try{
     await throttle();
@@ -170,10 +171,15 @@ function decideFromLs(ls){
   metrics.decide.not_live++; return { state:"not_live", viewers:null, src:"ls.notlive" };
 }
 
-/* ================== DEDUP ================== */
+/* ================== DEDUP / LOCK ================== */
 const recently = new Map(); // mint -> ts
 function markRecent(mint){ recently.set(mint, now()); }
-function seenRecently(mint){ const t = recently.get(mint); if (!t) return false; if (now() - t > DEDUP_TTL_MS){ recently.delete(mint); return false; } return true; }
+function seenRecently(mint){
+  const t = recently.get(mint);
+  if (!t) return false;
+  if (now() - t > DEDUP_TTL_MS){ recently.delete(mint); return false; }
+  return true;
+}
 
 /* ================== TELEGRAM ================== */
 async function tgApi(method, payload){
@@ -188,9 +194,14 @@ async function sendTGMessage(textHtml){
   if (!TG_BOT_TOKEN || !TG_CHAT_ID){ log("⚠️ TG creds missing: message not sent"); return { ok:false }; }
   return tgApi("sendMessage", { chat_id: TG_CHAT_ID, text: textHtml, parse_mode: "HTML", disable_web_page_preview: true });
 }
-function normalizeIpfs(u){ if (!u || typeof u !== "string") return null; u = u.trim(); if (!u) return null; if (u.startsWith("ipfs://")){ const cid = u.replace(/^ipfs:\/\//, ""); return `https://cloudflare-ipfs.com/ipfs/${cid}`; } return u; }
+function normalizeIpfs(u){
+  if (!u || typeof u !== "string") return null;
+  u = u.trim(); if (!u) return null;
+  if (u.startsWith("ipfs://")){ const cid = u.replace(/^ipfs:\/\//, ""); return `https://cloudflare-ipfs.com/ipfs/${cid}`; }
+  return u;
+}
 function pickImageCandidates(coin){
-  const fields = [ coin?.image_url, coin?.imageUrl, coin?.image, coin?.imageURI, coin?.image_uri, coin?.metadata?.image, coin?.twitter_pfp, coin?.twitter_profile_image_url, coin?.icon, coin?.logo, coin?.image_uri /* pump field */ ];
+  const fields = [ coin?.image_url, coin?.imageUrl, coin?.image, coin?.imageURI, coin?.image_uri, coin?.metadata?.image, coin?.twitter_pfp, coin?.twitter_profile_image_url, coin?.icon, coin?.logo, coin?.image_uri ];
   const out = [];
   for (const f of fields){ const u = normalizeIpfs(f); if (u && /^https?:\/\//i.test(u)) out.push(u); }
   if (TG_PLACEHOLDER_IMG) out.push(TG_PLACEHOLDER_IMG);
@@ -202,28 +213,28 @@ async function downloadImage(url){
   const ct = r.headers.get("content-type") || "";
   if (!ct.startsWith("image/")) { log(`🖼️ img bad type ${ct} | ${url}`); return null; }
   const ab = await r.arrayBuffer();
-  const max = 9.5 * 1024 * 1024; // TG limit ~10MB
+  const max = 9.5 * 1024 * 1024;
   if (ab.byteLength > max) { log(`🖼️ img too big ${ab.byteLength} | ${url}`); return null; }
   const ext = (ct.split("/")[1] || "jpg").split(";")[0];
   return { buffer: Buffer.from(ab), contentType: ct, filename: `cover.${ext}` };
 }
 async function sendPhotoWithFallback(captionHtml, urls){
   if (!TG_SEND_PHOTO || !TG_BOT_TOKEN || !TG_CHAT_ID || !urls?.length){ await sendTGMessage(captionHtml); return; }
-  // Try direct URL first, then upload
   for (const url of urls){
     const direct = await tgApi("sendPhoto", { chat_id: TG_CHAT_ID, photo: url, caption: captionHtml, parse_mode: "HTML" });
     if (direct?.ok){ log(`🖼️ TG photo: direct OK | ${url}`); return; }
     try{
-      const img = await downloadImage(url); if (!img) continue;
-      const form = new FormData();
-      form.append("chat_id", TG_CHAT_ID);
-      form.append("caption", captionHtml);
-      form.append("parse_mode", "HTML");
-      form.append("photo", img.buffer, { filename: img.filename, contentType: img.contentType });
-      const r = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, { method: "POST", body: form });
-      const j = await r.json().catch(()=> ({}));
-      if (j?.ok){ log(`🖼️ TG photo: upload OK | ${url}`); return; }
-      log(`⚠️ TG upload fail ${r.status} ${j?.description || ""}`);
+      const img = await downloadImage(url); if (img) {
+        const form = new FormData();
+        form.append("chat_id", TG_CHAT_ID);
+        form.append("caption", captionHtml);
+        form.append("parse_mode", "HTML");
+        form.append("photo", img.buffer, { filename: img.filename, contentType: img.contentType });
+        const r = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, { method: "POST", body: form });
+        const j = await r.json().catch(()=> ({}));
+        if (j?.ok){ log(`🖼️ TG photo: upload OK | ${url}`); return; }
+        log(`⚠️ TG upload fail ${r.status} ${j?.description || ""}`);
+      }
     }catch(e){ log(`⚠️ TG upload error: ${e.message}`); }
   }
   log("ℹ️ TG photo fallback → text only");
@@ -247,12 +258,17 @@ function pickInstagram(coin){
 function buildCaption(coin, j, elig){
   const name = coin?.name || ""; const symbol = coin?.symbol || "";
   const title = `${name}${symbol ? ` (${symbol})` : ""}` || "Live on pump.fun";
-  const line1 = `🟢 <b>LIVE ≥${ELIG_THRESHOLD}</b> | ${escapeHtml(title)}`;
+
+  const tickTag = ` [t=${j.eligTickIndex}/${j.eligTotalTicks}]`;
+  const srcTag  = j.viewerSrc ? ` src=${j.viewerSrc}` : "";
+
+  const line1 = `🟢 <b>LIVE ≥${ELIG_THRESHOLD}${tickTag}</b> | ${escapeHtml(title)}${srcTag}`;
   const lineTs = `🕒 <b>${fmtDateTime(now())}</b>`;
+  const mint = `🧬 Mint (CA):\n<code>${j.mint}</code>`;
   const viewersLine = `👁️ Viewers: <b>${fmtNum(elig.peak)}</b> (peak in ${Math.floor(ELIG_WINDOW_MS/1000)}s)`;
   const latLine = `⏱️ <b>+${fmtDur(j.liveAt - j.t0)}</b> от WS → LIVE, <b>+${fmtDur(elig.hitAt - j.liveAt)}</b> от LIVE → ≥${ELIG_THRESHOLD}`;
   const axiom = `🔗 Axiom:\nhttps://axiom.trade/t/${j.mint}`;
-  const mint = `🧬 Mint (CA):\n<code>${j.mint}</code>`;
+
   const lines = [line1, lineTs, mint, viewersLine, latLine, axiom];
   const www = pickWebsite(coin); if (www) lines.push(`🌐 Website: ${www}`);
   const ig = pickInstagram(coin); if (ig) lines.push(`📸 Instagram: ${ig}`);
@@ -271,7 +287,7 @@ function newJob(mint){
     // live
     liveHit: false,
     liveAt: null,
-    viewerSrc: null, // "ls.numParticipants" | "coin.viewers" | "coin.flag"
+    viewerSrc: null,
     // elig
     eligStarted: false,
     eligDone: false,
@@ -289,7 +305,15 @@ function newJob(mint){
   return j;
 }
 function clearJob(j){ j.closed = true; for (const id of j.timeouts) clearTimeout(id); j.timeouts.clear(); jobs.delete(j.mint); metrics.jobs.done++; }
-function schedule(j, label, atMs, fn){ const delay = Math.max(0, atMs - now()); const id = setTimeout(async () => { j.timeouts.delete(id); if (j.closed) return; try{ await fn(j, label); }catch(e){ log(`⚠️ job error [${label}] ${e.message}`); } }, delay); j.timeouts.add(id); }
+function schedule(j, label, atMs, fn){
+  const delay = Math.max(0, atMs - now());
+  const id = setTimeout(async () => {
+    j.timeouts.delete(id);
+    if (j.closed) return;
+    try{ await fn(j, label); }catch(e){ log(`⚠️ job error [${label}] ${e.message}`); }
+  }, delay);
+  j.timeouts.add(id);
+}
 
 /* ================== ELIGIBILITY ================== */
 function startEligibility(j, coin){
@@ -304,12 +328,16 @@ function startEligibility(j, coin){
     pushLat(metrics.lat_live, j.liveAt - j.t0);
     pushLat(metrics.lat_elig, j.eligHitAt - j.liveAt);
     metrics.elig.ok++;
-    // ensure coinSnap for image
+
+    // refresh dedup lock (чтобы не было повторов сразу после нотификации)
+    markRecent(j.mint);
+
     if (!j.coinSnap){ const rc = await fetchCoin(j.mint); if (rc.ok) j.coinSnap = rc.data; }
     const caption = buildCaption(j.coinSnap || {}, j, res);
     const imgs = pickImageCandidates(j.coinSnap || {});
     if (!imgs.length && TG_PLACEHOLDER_IMG) imgs.push(TG_PLACEHOLDER_IMG);
     await sendPhotoWithFallback(caption, imgs);
+
     log(`🛑 INSTANT-STOP | <mint=${j.mint}> | уведомлено, окно закрыто на ${j.eligTickIndex}/${j.eligTotalTicks}`);
     clearJob(j);
   };
@@ -341,18 +369,17 @@ function startEligibility(j, coin){
     j.eligTickIndex = Math.min(j.eligTickIndex + 1, j.eligTotalTicks);
 
     if (viewers !== null){
-      // track peak regardless of spike flag (for info)
       j.eligPeak = Math.max(j.eligPeak, viewers);
-      // anti-spike from below threshold
       const prev = j.lastViewers;
       if (prev != null && prev < ELIG_THRESHOLD && viewers >= ELIG_THRESHOLD){
         const bigJump = (viewers >= prev * SPIKE_RATIO) && ((viewers - prev) >= SPIKE_MIN_ABS);
         if (bigJump) spike = true;
       }
-      // counting
-      if (!spike && viewers >= ELIG_THRESHOLD){
+      // счёт: spike НЕ блокирует, если MIN_CONSEC_SAMPLES=1 или SPIKE_BLOCK=0
+      const blockSpike = SPIKE_BLOCK && MIN_CONSEC_SAMPLES > 1;
+      if ((!blockSpike || !spike) && viewers >= ELIG_THRESHOLD){
         j.eligOkSamples++; j.eligConsecOk++; if (!j.eligHitAt) j.eligHitAt = now();
-      } else if (!spike) {
+      } else if (!blockSpike) {
         j.eligConsecOk = 0;
       }
     }
@@ -374,6 +401,10 @@ function startEligibility(j, coin){
         pushLat(metrics.lat_live, j.liveAt - j.t0);
         pushLat(metrics.lat_elig, j.eligHitAt - j.liveAt);
         metrics.elig.ok++;
+
+        // refresh dedup lock после успеха
+        markRecent(j.mint);
+
         if (!j.coinSnap){ const rc = await fetchCoin(j.mint); if (rc.ok) j.coinSnap = rc.data; }
         const caption = buildCaption(j.coinSnap || {}, j, res);
         const imgs = pickImageCandidates(j.coinSnap || {});
@@ -388,7 +419,7 @@ function startEligibility(j, coin){
     }
   };
 
-  // first tick immediately
+  // первый тик — сразу
   schedule(j, "elig-tick", now() + 1, () => tick());
 }
 
@@ -399,15 +430,28 @@ async function slotProbe(j, label){
     const rls = await fetchLs(j.mint);
     if (rls.ok){
       const dec = decideFromLs(rls.data);
-      if (dec.state === "live"){ if (!j.liveAt){ j.liveAt = now(); j.viewerSrc = dec.src; log(`🔥 LIVE | ${j.mint} | src=${dec.src} | v=${dec.viewers ?? 'n/a'} | +${fmtDur(j.liveAt - j.t0)} от WS → candidate`); }
-        j.liveHit = true; startEligibility(j, null); return; }
+      if (dec.state === "live"){
+        if (!j.liveAt){
+          j.liveAt = now();
+          j.viewerSrc = dec.src;
+          log(`🔥 LIVE | ${j.mint} | src=${dec.src} | v=${dec.viewers ?? 'n/a'} | +${fmtDur(j.liveAt - j.t0)} от WS → candidate`);
+        }
+        j.liveHit = true; startEligibility(j, null); return;
+      }
     }
     // 2) fallback coins
     const rc = await fetchCoin(j.mint);
     if (rc.ok){
       const dec = decideFromCoin(rc.data);
-      if (dec.state === "live"){ if (!j.liveAt){ j.liveAt = now(); j.viewerSrc = dec.src; j.coinSnap = rc.data; log(`🔥 LIVE | ${j.mint} | src=${dec.src} | v=${dec.viewers ?? 'n/a'} | +${fmtDur(j.liveAt - j.t0)} от WS → candidate`); }
-        j.liveHit = true; startEligibility(j, rc.data); return; }
+      if (dec.state === "live"){
+        if (!j.liveAt){
+          j.liveAt = now();
+          j.viewerSrc = dec.src;
+          j.coinSnap = rc.data;
+          log(`🔥 LIVE | ${j.mint} | src=${dec.src} | v=${dec.viewers ?? 'n/a'} | +${fmtDur(j.liveAt - j.t0)} от WS → candidate`);
+        }
+        j.liveHit = true; startEligibility(j, rc.data); return;
+      }
     }
     if (i < QUICK_ATTEMPTS-1) await sleep(QUICK_STEP_MS);
   }
@@ -415,58 +459,51 @@ async function slotProbe(j, label){
   log(`… not live | ${j.mint} | slot=${label} | reason=clean-false | viewers=n/a`);
 }
 
-async function runStage(j, stage){ if (j.closed) return; await slotProbe(j, stage); if (j.closed || j.liveHit) return; if (stage === "first"){ schedule(j, "second", j.t0 + SECOND_CHECK_DELAY_MS, runStage); } else if (stage === "second"){ schedule(j, "third", j.t0 + THIRD_CHECK_DELAY_MS, runStage); } else if (stage === "third"){ metrics.jobs.final++; log(`↪️  schedule FINAL | ${j.mint}`); schedule(j, "final", j.t0 + FINAL_CHECK_DELAY_MS, runFinal); } }
-async function runFinal(j){ if (j.closed) return; await slotProbe(j, "final"); if (j.closed || j.liveHit) return; log(`🧹 final skip not_live | ${j.mint}`); clearJob(j); }
+async function runStage(j, stage){
+  if (j.closed) return;
+  await slotProbe(j, stage);
+  if (j.closed || j.liveHit) return;
+  if (stage === "first"){
+    schedule(j, "second", j.t0 + SECOND_CHECK_DELAY_MS, runStage);
+  } else if (stage === "second"){
+    schedule(j, "third",  j.t0 + THIRD_CHECK_DELAY_MS,  runStage);
+  } else if (stage === "third"){
+    metrics.jobs.final++; log(`↪️  schedule FINAL | ${j.mint}`);
+    schedule(j, "final",  j.t0 + FINAL_CHECK_DELAY_MS,  runFinal);
+  }
+}
+async function runFinal(j){
+  if (j.closed) return;
+  await slotProbe(j, "final");
+  if (j.closed || j.liveHit) return;
+  log(`🧹 final skip not_live | ${j.mint}`);
+  clearJob(j);
+}
 
 /* ================== WS CONNECTION ================== */
 let ws;
 function connectWS(){
   ws = new WebSocket(WS_URL);
-  ws.on("open", () => { log(`✅ WS connected: ${WS_URL}`); ws.send(JSON.stringify({ method: "subscribeNewToken" })); log("📡 Subscribed: subscribeNewToken"); });
+  ws.on("open", () => {
+    log(`✅ WS connected: ${WS_URL}`);
+    ws.send(JSON.stringify({ method: "subscribeNewToken" }));
+    log("📡 Subscribed: subscribeNewToken");
+  });
   ws.on("message", (raw) => {
     let msg = null; try{ msg = JSON.parse(raw.toString()); }catch{ return; }
     const mint = msg?.mint || msg?.tokenMint || msg?.ca || null; if (!mint) return;
     metrics.ws.events++;
     const existing = jobs.get(mint); const ts = now();
-    if (!existing){ if (!seenRecently(mint)) markRecent(mint); const j = newJob(mint); schedule(j, "first", j.t0 + FIRST_CHECK_DELAY_MS, runStage); return; }
-    if (!existing.liveHit && !existing.closed && (ts - existing.t0 <= WS_BUMP_WINDOW_MS)){ metrics.ws.bumps++; schedule(existing, "bump", ts + 1, runStage); } else { metrics.ws.dups++; }
+    if (!existing){
+      if (!seenRecently(mint)) markRecent(mint);
+      const j = newJob(mint);
+      schedule(j, "first", j.t0 + FIRST_CHECK_DELAY_MS, runStage);
+      return;
+    }
+    if (!existing.liveHit && !existing.closed && (ts - existing.t0 <= WS_BUMP_WINDOW_MS)){
+      metrics.ws.bumps++;
+      schedule(existing, "bump", ts + 1, runStage);
+    } else {
+      metrics.ws.dups++;
+    }
   });
-  ws.on("close", () => { log("WS closed → reconnect in 3s"); setTimeout(connectWS, 3000); });
-  ws.on("error", (e) => { log("WS error:", e?.message || e); });
-}
-
-/* ================== HEARTBEAT ================== */
-setInterval(() => {
-  const active = jobs.size;
-  const l1 = metrics.lat_live.slice().sort((a,b)=>a-b);
-  const l2 = metrics.lat_elig.slice().sort((a,b)=>a-b);
-  const p50L = percentile(l1,50), p95L = percentile(l1,95);
-  const p50E = percentile(l2,50), p95E = percentile(l2,95);
-  log(
-    `[stats] active=${active}`,
-    `http(coins): req=${metrics.http_coin.req} ok=${metrics.http_coin.ok} 429=${metrics.http_coin._429} http=${metrics.http_coin.http} html=${metrics.http_coin.html} empty=${metrics.http_coin.empty} parse=${metrics.http_coin.parse} throw=${metrics.http_coin.throw}`,
-    `http(ls): req=${metrics.http_ls.req} ok=${metrics.http_ls.ok} 429=${metrics.http_ls._429} http=${metrics.http_ls.http} throw=${metrics.http_ls.throw}`,
-    `decide: live=${metrics.decide.live} not_live=${metrics.decide.not_live} unknown=${metrics.decide.unknown}`,
-    `ws: events=${metrics.ws.events} dups=${metrics.ws.dups} bumps=${metrics.ws.bumps}`,
-    `jobs: new=${metrics.jobs.new} done=${metrics.jobs.done} final=${metrics.jobs.final}`,
-    `elig: started=${metrics.elig.started} ok=${metrics.elig.ok} fail=${metrics.elig.fail}`,
-    `| lat(LIVE) p50=${p50L?fmtDur(p50L):"n/a"} p95=${p95L?fmtDur(p95L):"n/a"}`,
-    `| lat(≥${ELIG_THRESHOLD}) p50=${p50E?fmtDur(p50E):"n/a"} p95=${p95E?fmtDur(p95E):"n/a"}`
-  );
-}, HEARTBEAT_MS);
-
-/* ================== START ================== */
-log("Zero-miss watcher starting…",
-  "| DELAYS=", `${FIRST_CHECK_DELAY_MS}/${SECOND_CHECK_DELAY_MS}/${THIRD_CHECK_DELAY_MS}/final@${FINAL_CHECK_DELAY_MS}`,
-  "| SLOT=", `${QUICK_ATTEMPTS}x${QUICK_STEP_MS}ms`,
-  "| RPS=", GLOBAL_RPS,
-  "| ELIG=", `≥${ELIG_THRESHOLD} for ${Math.floor(ELIG_WINDOW_MS/1000)}s step ${Math.floor(ELIG_STEP_MS/1000)}s`,
-  "| INSTANT=", ELIG_INSTANT ? `on (minConsec=${MIN_CONSEC_SAMPLES})` : "off",
-  "| TZ=", TZ_LABEL,
-  "| no-304 on livestream"
-);
-
-connectWS();
-
-process.on("SIGTERM", ()=>process.exit(0));
-process.on("SIGINT", ()=>process.exit(0));
