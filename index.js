@@ -1,9 +1,7 @@
-Перейти к содержимому
-Журнал чата
+// zero-miss live catcher — v12.1
+// WS → multi-stage (5s/10s/15s) → final@45s | TG notify | eligible ≥N/window
+// features: instant-send+stop, X/N stabilize logs, ca=<mint> in logs
 
-Вы сказали:
-// zero-miss live catcher — v12.0 (WS → multi-stage → final@45s) + TG + eligible≥N/window
-// features: instant-send+stop, X/N stabilize logs, configurable window/step
 import process from "node:process";
 import WebSocket from "ws";
 import fetch from "node-fetch";
@@ -18,7 +16,7 @@ function envS(name, def) { const v = (process.env[name] || "").trim(); return v 
 const WS_URL = envS("PUMP_WS_URL", "wss://pumpportal.fun/api/data");
 const API    = envS("PUMP_API",    "https://frontend-api-v3.pump.fun");
 
-const VIEWERS_THRESHOLD      = envI("VIEWERS_THRESHOLD", 1);     // для первичного LIVE-решения
+const VIEWERS_THRESHOLD      = envI("VIEWERS_THRESHOLD", 1);     // первичное решение LIVE
 const FIRST_CHECK_DELAY_MS   = envI("FIRST_CHECK_DELAY_MS", 5000);
 const SECOND_CHECK_DELAY_MS  = envI("SECOND_CHECK_DELAY_MS", 10000);
 const THIRD_CHECK_DELAY_MS   = envI("THIRD_CHECK_DELAY_MS", 15000);
@@ -31,29 +29,28 @@ const GLOBAL_RPS             = envN("GLOBAL_RPS", 3);
 const JITTER_MS              = envI("JITTER_MS", 120);
 const PENALTY_AFTER_429_MS   = envI("PENALTY_AFTER_429_MS", 30000);
 
-const DEDUP_TTL_MS           = envI("DEDUP_TTL_MS", 600000);
+const DEDUP_TTL_MS           = envI("DEDUP_TTL_MS", 600000);     // 10 минут
 const WS_BUMP_WINDOW_MS      = envI("WS_BUMP_WINDOW_MS", 60000);
 
 const HEARTBEAT_MS           = envI("HEARTBEAT_MS", 30000);
 
-// Eligibility (лайвы ≥N в течение окна)
+// Eligibility (≥N в окне)
 const ELIG_THRESHOLD         = envI("ELIG_THRESHOLD", 30);
 const ELIG_WINDOW_MS         = envI("ELIG_WINDOW_MS", 30000);
-const ELIG_STEP_MS           = envI("ELIG_STEP_MS", 5000);
+const ELIG_STEP_MS           = envI("ELIG_STEP_MS", 3000);
 
-// Instant режим (то, о чём договорились)
-const ELIG_INSTANT           = envI("ELIG_INSTANT", 1);        // 1 — сразу отправлять при первом ≥N
-const MIN_CONSEC_SAMPLES     = envI("MIN_CONSEC_SAMPLES", 1);  // подряд тиков ≥N для триггера (оставь 1)
-const INSTANT_MODE           = "stop";                          // фиксируем «stop» по твоему запросу
+// Instant режим (как договорились)
+const ELIG_INSTANT           = envI("ELIG_INSTANT", 1);        // 1 — мгновенная отправка
+const MIN_CONSEC_SAMPLES     = envI("MIN_CONSEC_SAMPLES", 1);  // сколько подряд тиков ≥N
+const INSTANT_MODE           = "stop";                          // фиксируем stop
 
-// Telegram (дефолты — можно переопределить ENV-ами)
+// Telegram (временные дефолты — твои старые ключи по просьбе)
 const TG_BOT_TOKEN           = envS("TG_BOT_TOKEN", "7598357622:AAHeGIaZJYzkfw58gpR1aHC4r4q315WoNKc");
 const TG_CHAT_ID             = envS("TG_CHAT_ID",   "-4857972467");
 const TG_SEND_PHOTO          = envI("TG_SEND_PHOTO", 1);
 const TG_PLACEHOLDER_IMG     = envS("TG_PLACEHOLDER_IMG", "");
 
-
-// TZ для меток времени в телеге
+// Временная зона для меток в TG
 const TZ_LABEL               = envS("TIMEZONE", "Europe/Moscow");
 
 /* ================== HELPERS ================== */
@@ -66,10 +63,6 @@ function fmtNum(n){
   if (n == null || !Number.isFinite(Number(n))) return "n/a";
   return Number(n).toLocaleString("en-US");
 }
-function fmtUsd(n){
-  if (n == null || !Number.isFinite(Number(n))) return "n/a";
-  return $${Number(n).toLocaleString("en-US", {maximumFractionDigits: 2})};
-}
 function fmtDur(ms){ return (ms/1000).toFixed(2) + "s"; }
 function fmtDateTime(ts){
   const d = new Date(ts);
@@ -77,7 +70,15 @@ function fmtDateTime(ts){
     timeZone: TZ_LABEL, year:"numeric", month:"2-digit", day:"2-digit",
     hour:"2-digit", minute:"2-digit", second:"2-digit"
   }).format(d);
-  return ${dt} (${TZ_LABEL});
+  return `${dt} (${TZ_LABEL})`;
+}
+const caShort = (mint) => {
+  if (!mint || mint.length < 8) return mint || "n/a";
+  return `${mint.slice(0,4)}...${mint.slice(-4)}`;
+};
+function escapeHtml(s){
+  return String(s || "")
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
 
 /* ================== METRICS ================== */
@@ -90,9 +91,8 @@ const metrics = {
   final_checks:0,
   elig_started:0, elig_ok:0, elig_fail:0,
   lat_live: [],   // ms: WS → LIVE
-  lat_elig: []    // ms: LIVE → ≥N (первый тик)
+  lat_elig: []    // ms: LIVE → ≥N
 };
-
 function pushLat(arr, v, cap=5000){ arr.push(v); if (arr.length > cap) arr.shift(); }
 function percentile(sorted, p){ if (!sorted.length) return null; const idx = Math.floor((p/100)*(sorted.length-1)); return sorted[idx]; }
 
@@ -111,10 +111,10 @@ async function throttle(){
   nextAllowedAt = now() + gap + jitter;
 }
 
-/* ================== FETCH COIN (ROBUST) ================== */
+/* ================== FETCH COIN ================== */
 
 async function fetchCoin(mint){
-  const url = ${API}/coins/${encodeURIComponent(mint)}?_=${Date.now()}&n=${Math.random().toString(36).slice(2,8)};
+  const url = `${API}/coins/${encodeURIComponent(mint)}?_=${Date.now()}&n=${Math.random().toString(36).slice(2,8)}`;
   try{
     await throttle();
     metrics.api_req++;
@@ -123,7 +123,7 @@ async function fetchCoin(mint){
         "accept": "application/json, text/plain, */*",
         "cache-control": "no-cache, no-store",
         "pragma": "no-cache",
-        "user-agent": "pumplive/v12.0-zero-miss"
+        "user-agent": "pumplive/v12.1-zero-miss"
       }
     });
 
@@ -189,7 +189,7 @@ function decideFromCoin(c){
 /* ================== DEDUP ================== */
 
 const jobs = new Map();     // mint -> Job
-const recently = new Map(); // грубая дедупликация WS событий
+const recently = new Map(); // грубая дедуп WS событий
 
 function markRecent(mint){ recently.set(mint, now()); }
 function seenRecently(mint){
@@ -202,7 +202,7 @@ function seenRecently(mint){
 /* ================== TELEGRAM ================== */
 
 async function tgApi(method, payload){
-  const url = https://api.telegram.org/bot${TG_BOT_TOKEN}/${method};
+  const url = `https://api.telegram.org/bot${TG_BOT_TOKEN}/${method}`;
   const r = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -210,7 +210,7 @@ async function tgApi(method, payload){
   });
   const j = await r.json().catch(()=> ({}));
   if (!j?.ok){
-    log(⚠️ TG ${method} fail: ${r.status} ${j?.description || ""});
+    log(`⚠️ TG ${method} fail: ${r.status} ${j?.description || ""}`);
   }
   return j;
 }
@@ -228,7 +228,7 @@ function normalizeIpfs(u){
   if (!u) return null;
   if (u.startsWith("ipfs://")){
     const cid = u.replace(/^ipfs:\/\//, "");
-    return https://cloudflare-ipfs.com/ipfs/${cid};
+    return `https://cloudflare-ipfs.com/ipfs/${cid}`;
   }
   return u;
 }
@@ -248,14 +248,14 @@ function pickImageCandidates(coin){
 }
 async function downloadImage(url){
   const r = await fetch(url, { headers: { "user-agent": "Mozilla/5.0 pumplive" } });
-  if (!r.ok) { log(🖼️ img http ${r.status} | ${url}); return null; }
+  if (!r.ok) { log(`🖼️ img http ${r.status} | ${url}`); return null; }
   const ct = r.headers.get("content-type") || "";
-  if (!ct.startsWith("image/")) { log(🖼️ img bad type ${ct} | ${url}); return null; }
+  if (!ct.startsWith("image/")) { log(`🖼️ img bad type ${ct} | ${url}`); return null; }
   const ab = await r.arrayBuffer();
   const max = 9.5 * 1024 * 1024; // лимит TG ~10MB
-  if (ab.byteLength > max) { log(🖼️ img too big ${ab.byteLength} | ${url}); return null; }
+  if (ab.byteLength > max) { log(`🖼️ img too big ${ab.byteLength} | ${url}`); return null; }
   const ext = (ct.split("/")[1] || "jpg").split(";")[0];
-  return { buffer: Buffer.from(ab), contentType: ct, filename: cover.${ext} };
+  return { buffer: Buffer.from(ab), contentType: ct, filename: `cover.${ext}` };
 }
 async function sendPhotoWithFallback(captionHtml, urls){
   if (!TG_SEND_PHOTO || !TG_BOT_TOKEN || !TG_CHAT_ID){
@@ -263,13 +263,11 @@ async function sendPhotoWithFallback(captionHtml, urls){
     return;
   }
   for (const url of urls){
-    // 1) прямой URL
     const direct = await tgApi("sendPhoto", {
       chat_id: TG_CHAT_ID, photo: url, caption: captionHtml, parse_mode: "HTML"
     });
-    if (direct?.ok){ log(🖼️ TG photo: direct OK | ${url}); return; }
+    if (direct?.ok){ log(`🖼️ TG photo: direct OK | ${url}`); return; }
 
-    // 2) fallback: скачать и загрузить
     try{
       const img = await downloadImage(url);
       if (!img) continue;
@@ -279,12 +277,12 @@ async function sendPhotoWithFallback(captionHtml, urls){
       form.append("parse_mode", "HTML");
       form.append("photo", img.buffer, { filename: img.filename, contentType: img.contentType });
 
-      const r = await fetch(https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto, { method: "POST", body: form });
+      const r = await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, { method: "POST", body: form });
       const j = await r.json().catch(()=> ({}));
-      if (j?.ok){ log(🖼️ TG photo: upload OK | ${url}); return; }
-      log(⚠️ TG upload fail ${r.status} ${j?.description || ""});
+      if (j?.ok){ log(`🖼️ TG photo: upload OK | ${url}`); return; }
+      log(`⚠️ TG upload fail ${r.status} ${j?.description || ""}`);
     }catch(e){
-      log(⚠️ TG upload error: ${e.message});
+      log(`⚠️ TG upload error: ${e.message}`);
     }
   }
   log("ℹ️ TG photo fallback → text only");
@@ -309,7 +307,7 @@ function pickTwitter(coin){
     if (!u) continue;
     if (/^https?:\/\//i.test(u)) return u;
     if (u.startsWith("@")) u = u.slice(1);
-    return https://twitter.com/${u};
+    return `https://twitter.com/${u}`;
   }
   return null;
 }
@@ -321,38 +319,33 @@ function pickInstagram(coin){
     if (!u) continue;
     if (/^https?:\/\//i.test(u)) return u;
     if (u.startsWith("@")) u = u.slice(1);
-    return https://instagram.com/${u};
+    return `https://instagram.com/${u}`;
   }
   return null;
-}
-
-function escapeHtml(s){
-  return String(s || "")
-    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 }
 
 function buildCaption(coin, j, elig){
   const name   = coin?.name || "";
   const symbol = coin?.symbol || "";
-  const title  = ${name}${symbol ?  (${symbol}) : ""} || "Live on pump.fun";
+  const title  = `${name}${symbol ? ` (${symbol})` : ""}` || "Live on pump.fun";
 
-  const line1  = 🟢 <b>LIVE ≥${ELIG_THRESHOLD}</b> | ${escapeHtml(title)};
-  const lineTs = 🕒 <b>${fmtDateTime(now())}</b>;
+  const line1  = `🟢 <b>LIVE ≥${ELIG_THRESHOLD}</b> | ${escapeHtml(title)}`;
+  const lineTs = `🕒 <b>${fmtDateTime(now())}</b>`;
 
-  const viewersLine = 👁️ Viewers: <b>${fmtNum(elig.peak)}</b> (peak in ${Math.floor(ELIG_WINDOW_MS/1000)}s);
-  const latLine     = ⏱️ <b>+${fmtDur(j.liveAt - j.t0)}</b> от WS → LIVE, <b>+${fmtDur(elig.hitAt - j.liveAt)}</b> от LIVE → ≥${ELIG_THRESHOLD};
+  const viewersLine = `👁️ Viewers: <b>${fmtNum(elig.peak)}</b> (peak in ${Math.floor(ELIG_WINDOW_MS/1000)}s)`;
+  const latLine     = `⏱️ <b>+${fmtDur(j.liveAt - j.t0)}</b> от WS → LIVE, <b>+${fmtDur(elig.hitAt - j.liveAt)}</b> от LIVE → ≥${ELIG_THRESHOLD}`;
 
-  const axiom = 🔗 Axiom:\nhttps://axiom.trade/t/${j.mint};
-  const mint  = 🧬 Mint (CA):\n<code>${j.mint}</code>;
+  const axiom = `🔗 Axiom:\nhttps://axiom.trade/t/${j.mint}`;
+  const mint  = `🧬 Mint (CA):\n<code>${j.mint}</code>`;
 
   const lines = [line1, lineTs, mint, viewersLine, latLine, axiom];
 
   const www = pickWebsite(coin);
-  if (www) lines.push(🌐 Website: ${www});
+  if (www) lines.push(`🌐 Website: ${www}`);
   const ig = pickInstagram(coin);
-  if (ig) lines.push(📸 Instagram: ${ig});
+  if (ig) lines.push(`📸 Instagram: ${ig}`);
   const tw = pickTwitter(coin);
-  if (tw) lines.push(🐦 Twitter: ${tw});
+  if (tw) lines.push(`🐦 Twitter: ${tw}`);
 
   return lines.join("\n");
 }
@@ -375,11 +368,12 @@ function newJob(mint){
     eligDone: false,
     eligHitAt: null,
     eligPeak: 0,
-    eligOkSamples: 0,     // сколько тиков ≥ порога (необязательно подряд)
+    eligOkSamples: 0,     // тиков ≥ порога (не обязательно подряд)
     eligConsecOk: 0,      // подряд тиков ≥ порога
     eligTotalSamples: 0,
     eligTickIndex: 0,     // 1..N
-    eligTotalTicks: Math.max(1, Math.ceil(ELIG_WINDOW_MS / Math.max(1, ELIG_STEP_MS)))
+    eligTotalTicks: Math.max(1, Math.ceil(ELIG_WINDOW_MS / Math.max(1, ELIG_STEP_MS))),
+    coinSnap: null        // последний coin для подписи TG
   };
   jobs.set(mint, j);
   metrics.jobs_created++;
@@ -400,7 +394,7 @@ function schedule(j, label, atMs, fn){
     try{
       await fn(j, label);
     }catch(e){
-      log(⚠️ job error [${label}] ${e.message});
+      log(`⚠️ job error [${label}] ${e.message}`);
     }
   }, delay);
   j.timeouts.add(id);
@@ -411,13 +405,13 @@ function schedule(j, label, atMs, fn){
 function startEligibility(j, coin){
   if (j.eligStarted) return;
   j.eligStarted = true;
+  j.coinSnap = coin;
   metrics.elig_started++;
 
   const windowEnd = now() + ELIG_WINDOW_MS;
-  log(🎯 ELIG start ${Math.floor(ELIG_WINDOW_MS/1000)}s | ${j.mint} | thr=${ELIG_THRESHOLD} | step=${Math.floor(ELIG_STEP_MS/1000)}s | ticks=${j.eligTotalTicks});
+  log(`🎯 ELIG start ${Math.floor(ELIG_WINDOW_MS/1000)}s | ca=${caShort(j.mint)} | thr=${ELIG_THRESHOLD} | step=${Math.floor(ELIG_STEP_MS/1000)}s | ticks=${j.eligTotalTicks}`);
 
   const instantSendAndStop = async () => {
-    // успех: отправим в TG (мгновенно) и закроем джобу
     const res = { peak: j.eligPeak, hitAt: j.eligHitAt };
     const latLiveMs = j.liveAt - j.t0;
     const latEligMs = j.eligHitAt - j.liveAt;
@@ -425,34 +419,34 @@ function startEligibility(j, coin){
     pushLat(metrics.lat_elig, latEligMs);
     metrics.elig_ok++;
 
-    log(⚡ INSTANT ELIGIBLE (≥${ELIG_THRESHOLD}) | ${j.mint} | hit@+${fmtDur(latEligMs)} от LIVE (+${fmtDur(latLiveMs)} от WS) | max=${j.eligPeak} | samples=${j.eligOkSamples}/${j.eligTickIndex});
+    log(`⚡ INSTANT ELIGIBLE (≥${ELIG_THRESHOLD}) | ${j.mint} | hit@+${fmtDur(latEligMs)} от LIVE (+${fmtDur(latLiveMs)} от WS) | max=${j.eligPeak} | samples=${j.eligOkSamples}/${j.eligTickIndex}`);
 
-    const caption = buildCaption(coin, j, res);
-    const imgs = pickImageCandidates(coin);
+    const caption = buildCaption(j.coinSnap || {}, j, res);
+    const imgs = pickImageCandidates(j.coinSnap || {});
     await sendPhotoWithFallback(caption, imgs);
 
-    log(🛑 INSTANT-STOP | <mint=${j.mint}> | уведомлено, окно закрыто на ${j.eligTickIndex}/${j.eligTotalTicks});
+    log(`🛑 INSTANT-STOP | <mint=${j.mint}> | уведомлено, окно закрыто на ${j.eligTickIndex}/${j.eligTotalTicks}`);
     clearJob(j);
   };
 
   const tick = async () => {
     if (j.closed || j.eligDone) return;
 
-    // защита от бесконечного цикла при нулевом шаге
     const step = Math.max(1, ELIG_STEP_MS);
 
     const r = await fetchCoin(j.mint);
     if (r.ok){
       const c = r.data || {};
+      j.coinSnap = j.coinSnap || c;   // сохраним первый удачный снапшот на всякий случай
       const v = extractViewers(c);
-      const state = decideFromCoin(c).state;
+      const dec = decideFromCoin(c);
+      const state = dec.state;
 
       j.eligTotalSamples++;
       j.eligTickIndex = Math.min(j.eligTickIndex + 1, j.eligTotalTicks);
       if (v !== null) j.eligPeak = Math.max(j.eligPeak, v);
 
-      const idx = j.eligTickIndex;
-      const tot = j.eligTotalTicks;
+      const idx = j.eligTickIndex, tot = j.eligTotalTicks;
 
       if (v !== null && v >= ELIG_THRESHOLD){
         j.eligOkSamples++;
@@ -462,20 +456,20 @@ function startEligibility(j, coin){
         j.eligConsecOk = 0;
       }
 
-      log(⏱️ stabilize ${idx}/${tot} | state=${state} | viewers=${v ?? "n/a"} | ok=${j.eligOkSamples} | consec=${j.eligConsecOk});
+      log(`⏱️ stabilize ${idx}/${tot} | ca=${caShort(j.mint)} | state=${state} | viewers=${v ?? "n/a"} | ok=${j.eligOkSamples} | consec=${j.eligConsecOk}`);
 
-      // === INSTANT SEND + STOP ===
+      // INSTANT SEND + STOP
       if (ELIG_INSTANT && j.eligConsecOk >= MIN_CONSEC_SAMPLES){
-        j.eligDone = true;           // блокируем последующие тики
-        await instantSendAndStop();  // отправляем и очищаем job
+        j.eligDone = true;
+        await instantSendAndStop();
         return;
       }
 
     }else{
       j.eligTotalSamples++;
       j.eligTickIndex = Math.min(j.eligTickIndex + 1, j.eligTotalTicks);
-      log(⏱️ stabilize err: ${r.kind}${r.status? " "+r.status:""});
-      // при ошибке не трогаем consecOk
+      log(`⏱️ stabilize ${j.eligTickIndex}/${j.eligTotalTicks} | ca=${caShort(j.mint)} | err: ${r.kind}${r.status? " "+r.status:""}`);
+      // consecOk не меняем
     }
 
     if (now() < windowEnd && j.eligTickIndex < j.eligTotalTicks){
@@ -483,7 +477,7 @@ function startEligibility(j, coin){
     }else{
       j.eligDone = true;
       if (j.eligHitAt){
-        // это случай, когда ELIG_INSTANT=0 (теоретически) — тогда отправка в конце окна
+        // этот блок нужен если ELIG_INSTANT=0; при instant он не дойдёт сюда
         const res = { peak: j.eligPeak, hitAt: j.eligHitAt };
         const latLiveMs = j.liveAt - j.t0;
         const latEligMs = j.eligHitAt - j.liveAt;
@@ -491,14 +485,14 @@ function startEligibility(j, coin){
         pushLat(metrics.lat_elig, latEligMs);
         metrics.elig_ok++;
 
-        log(✅ ELIGIBLE (≥${ELIG_THRESHOLD}) | ${j.mint} | hit@+${fmtDur(latEligMs)} от LIVE (+${fmtDur(latLiveMs)} от WS) | max=${j.eligPeak} | samples=${j.eligOkSamples}/${j.eligTotalSamples});
+        log(`✅ ELIGIBLE (≥${ELIG_THRESHOLD}) | ${j.mint} | hit@+${fmtDur(latEligMs)} от LIVE (+${fmtDur(latLiveMs)} от WS) | max=${j.eligPeak} | samples=${j.eligOkSamples}/${j.eligTotalSamples}`);
 
-        const caption = buildCaption(c, j, res);
-        const imgs = pickImageCandidates(c);
+        const caption = buildCaption(j.coinSnap || {}, j, res);
+        const imgs = pickImageCandidates(j.coinSnap || {});
         await sendPhotoWithFallback(caption, imgs);
       }else{
         metrics.elig_fail++;
-        log(🚫 NOT ELIGIBLE (<${ELIG_THRESHOLD} за ${Math.floor(ELIG_WINDOW_MS/1000)}s) | ${j.mint} | max=${j.eligPeak} | valid=${j.eligOkSamples}/${j.eligTotalSamples} | firstLIVE@+${fmtDur(j.liveAt - j.t0)});
+        log(`🚫 NOT ELIGIBLE (<${ELIG_THRESHOLD} за ${Math.floor(ELIG_WINDOW_MS/1000)}s) | ${j.mint} | max=${j.eligPeak} | valid=${j.eligOkSamples}/${j.eligTotalSamples} | firstLIVE@+${fmtDur(j.liveAt - j.t0)}`);
       }
       clearJob(j);
     }
@@ -515,31 +509,28 @@ async function slotProbe(j, label){
   let localUnknown = 0;
   let localFalse = 0;
   let lastCoin = null;
-  let lastDecision = null;
 
   for (let i=0; i<QUICK_ATTEMPTS; i++){
     const r = await fetchCoin(j.mint);
     if (!r.ok){
       localUnknown++;
       if (r.kind === "html" || r.kind === "empty" || r.kind === "http" || r.kind === "parse"){
-        log(❌ fetch error: ${r.kind}${r.status ? " "+r.status:""} | mint: ${j.mint});
+        log(`❌ fetch error: ${r.kind}${r.status ? " "+r.status:""} | mint: ${j.mint}`);
       }else if (r.kind === "429"){
-        log(❌ fetch error: HTTP 429 | mint: ${j.mint} (penalty ${PENALTY_AFTER_429_MS}ms));
+        log(`❌ fetch error: HTTP 429 | mint: ${j.mint} (penalty ${PENALTY_AFTER_429_MS}ms)`);
       }else{
-        log(❌ fetch error: ${r.kind}${r.msg? " "+r.msg:""} | mint: ${j.mint});
+        log(`❌ fetch error: ${r.kind}${r.msg? " "+r.msg:""} | mint: ${j.mint}`);
       }
     }else{
       const coin = r.data || {};
       lastCoin = coin;
       const dec = decideFromCoin(coin);
-      lastDecision = dec;
       const v = dec.viewers ?? "n/a";
 
       if (dec.state === "live"){
         if (!j.liveAt) {
           j.liveAt = now();
-          log(🔥 LIVE | ${j.mint} | ${coin?.symbol ? coin.symbol+" " : ""}(${coin?.name || "no-name"}) | v=${v} | reason=${dec.reason}${dec.liveFlag?"/flag":""} | +${fmtDur(j.liveAt - j.t0)} от WS → candidate);
-          // старт eligibility
+          log(`🔥 LIVE | ${j.mint} | ${coin?.symbol ? coin.symbol+" " : ""}(${coin?.name || "no-name"}) | v=${v} | reason=${dec.reason}${dec.liveFlag?"/flag":""} | +${fmtDur(j.liveAt - j.t0)} от WS → candidate`);
           startEligibility(j, coin);
         }
         j.liveHit = true;
@@ -549,7 +540,7 @@ async function slotProbe(j, label){
         localUnknown++;
       }else{
         localFalse++;
-        log(… not live | ${j.mint} | slot=${label} | viewers=${v} | is_currently_live=false);
+        log(`… not live | ${j.mint} | slot=${label} | viewers=${v} | is_currently_live=false`);
       }
     }
     if (i < QUICK_ATTEMPTS-1) await sleep(QUICK_STEP_MS);
@@ -557,40 +548,39 @@ async function slotProbe(j, label){
 
   j.seenUnknown += localUnknown;
   j.goodFalse   += localFalse;
-  return { localLive, localUnknown, localFalse, lastCoin, lastDecision };
+  return { localLive, lastCoin };
 }
 
 async function runStage(j, stage){
   if (j.closed) return;
 
-  const { localLive } = await slotProbe(j, stage);
+  await slotProbe(j, stage);
   if (j.closed) return;
 
   if (j.liveHit){
-    // Eligibility сама завершит job
-    return;
+    return; // eligibility дальше сама почистит
   }
 
   if (stage === "first"){
     schedule(j, "second", j.t0 + SECOND_CHECK_DELAY_MS, runStage);
   }else if (stage === "second"){
-    schedule(j, "third", j.t0 + THIRD_CHECK_DELAY_MS, runStage);
+    schedule(j, "third",  j.t0 + THIRD_CHECK_DELAY_MS,  runStage);
   }else if (stage === "third"){
     metrics.final_checks++;
-    log(↪️  schedule FINAL | ${j.mint} | reason=always goodFalse=${j.goodFalse} unknown=${j.seenUnknown});
-    schedule(j, "final", j.t0 + FINAL_CHECK_DELAY_MS, runFinal);
+    log(`↪️  schedule FINAL | ${j.mint} | goodFalse=${j.goodFalse} unknown=${j.seenUnknown}`);
+    schedule(j, "final",  j.t0 + FINAL_CHECK_DELAY_MS,  runFinal);
   }
 }
 
 async function runFinal(j){
   if (j.closed) return;
-  const { localLive } = await slotProbe(j, "final");
+  await slotProbe(j, "final");
   if (j.closed) return;
 
-  if (j.liveHit || localLive){
-    return; // eligibility возьмёт дальше
+  if (j.liveHit){
+    return; // eligibility в процессе
   }
-  log(🧹 final skip not_live | ${j.mint} | goodFalse=${j.goodFalse} unknown=${j.seenUnknown});
+  log(`🧹 final skip not_live | ${j.mint} | goodFalse=${j.goodFalse} unknown=${j.seenUnknown}`);
   clearJob(j);
 }
 
@@ -600,7 +590,7 @@ let ws;
 function connectWS(){
   ws = new WebSocket(WS_URL);
   ws.on("open", () => {
-    log(✅ WS connected: ${WS_URL});
+    log(`✅ WS connected: ${WS_URL}`);
     ws.send(JSON.stringify({ method: "subscribeNewToken" }));
     log("📡 Subscribed: subscribeNewToken");
   });
@@ -646,14 +636,14 @@ setInterval(() => {
   const p50E = percentile(l2,50), p95E = percentile(l2,95);
 
   log(
-    [stats] active=${active},
-    api:req=${metrics.api_req} ok=${metrics.api_ok} html=${metrics.api_html} empty=${metrics.api_empty} parse=${metrics.api_parse} http=${metrics.api_http} 429=${metrics.api_429} throw=${metrics.api_throw},
-    decide: live=${metrics.decide_live} not_live=${metrics.decide_not_live} unknown=${metrics.decide_unknown},
-    ws: events=${metrics.ws_events} dups=${metrics.ws_dups} bumps=${metrics.ws_bumps},
-    jobs: new=${metrics.jobs_created} done=${metrics.jobs_finished} final=${metrics.final_checks},
-    elig: started=${metrics.elig_started} ok=${metrics.elig_ok} fail=${metrics.elig_fail},
-    | lat(LIVE) p50=${p50L?fmtDur(p50L):"n/a"} p95=${p95L?fmtDur(p95L):"n/a"},
-    | lat(≥${ELIG_THRESHOLD}) p50=${p50E?fmtDur(p50E):"n/a"} p95=${p95E?fmtDur(p95E):"n/a"}
+    `[stats] active=${active}`,
+    `api:req=${metrics.api_req} ok=${metrics.api_ok} html=${metrics.api_html} empty=${metrics.api_empty} parse=${metrics.api_parse} http=${metrics.api_http} 429=${metrics.api_429} throw=${metrics.api_throw}`,
+    `decide: live=${metrics.decide_live} not_live=${metrics.decide_not_live} unknown=${metrics.decide_unknown}`,
+    `ws: events=${metrics.ws_events} dups=${metrics.ws_dups} bumps=${metrics.ws_bumps}`,
+    `jobs: new=${metrics.jobs_created} done=${metrics.jobs_finished} final=${metrics.final_checks}`,
+    `elig: started=${metrics.elig_started} ok=${metrics.elig_ok} fail=${metrics.elig_fail}`,
+    `| lat(LIVE) p50=${p50L?fmtDur(p50L):"n/a"} p95=${p95L?fmtDur(p95L):"n/a"}`,
+    `| lat(≥${ELIG_THRESHOLD}) p50=${p50E?fmtDur(p50E):"n/a"} p95=${p95E?fmtDur(p95E):"n/a"}`
   );
 }, HEARTBEAT_MS);
 
@@ -661,11 +651,11 @@ setInterval(() => {
 
 log("Zero-miss watcher starting…",
   "| THR=", VIEWERS_THRESHOLD,
-  "| DELAYS=", ${FIRST_CHECK_DELAY_MS}/${SECOND_CHECK_DELAY_MS}/${THIRD_CHECK_DELAY_MS}/final@${FINAL_CHECK_DELAY_MS},
-  "| SLOT=", ${QUICK_ATTEMPTS}x${QUICK_STEP_MS}ms,
+  "| DELAYS=", `${FIRST_CHECK_DELAY_MS}/${SECOND_CHECK_DELAY_MS}/${THIRD_CHECK_DELAY_MS}/final@${FINAL_CHECK_DELAY_MS}`,
+  "| SLOT=", `${QUICK_ATTEMPTS}x${QUICK_STEP_MS}ms`,
   "| RPS=", GLOBAL_RPS,
-  "| ELIG=", ≥${ELIG_THRESHOLD} for ${Math.floor(ELIG_WINDOW_MS/1000)}s step ${Math.floor(ELIG_STEP_MS/1000)}s,
-  "| INSTANT=", ELIG_INSTANT ? on (minConsec=${MIN_CONSEC_SAMPLES}, mode=${INSTANT_MODE}) : "off",
+  "| ELIG=", `≥${ELIG_THRESHOLD} for ${Math.floor(ELIG_WINDOW_MS/1000)}s step ${Math.floor(ELIG_STEP_MS/1000)}s`,
+  "| INSTANT=", ELIG_INSTANT ? `on (minConsec=${MIN_CONSEC_SAMPLES}, mode=${INSTANT_MODE})` : "off",
   "| TZ=", TZ_LABEL
 );
 
@@ -673,80 +663,4 @@ connectWS();
 
 /* ================== Graceful ================== */
 process.on("SIGTERM", ()=>process.exit(0));
-process.on("SIGINT", ()=>process.exit(0));   
-
-
-привет что может мой код ? коротко
-ChatGPT сказал:
-
-Думал на протяжении 28s
-Коротко: это ловец лайв-появлений новых токенов на pump.fun с мгновенными алертами в Telegram.
-
-Подключается к WS pumpportal.fun, ловит новые mint’ы.
-
-По каждому mint делает многостадийные проверки через REST frontend-api-v3.pump.fun с троттлингом/джиттером и штрафом после 429.
-
-Определяет “live” по флагам/числу зрителей; затем запускает окно eligibility (≥N зрителей за заданный интервал, дискретный шаг).
-
-В instant-режиме при первом выполнении условия сразу шлёт и останавливает джобу (mode=“stop”).
-
-Отправляет в Telegram карточку (фото/фолбэк на текст): имя/тикер, CA, пик зрителей, задержки WS→LIVE и LIVE→≥N, ссылки (Axiom/сайт/Twitter/IG), таймстемп в заданном TZ.
-
-Есть дедуп событий, метрики и heartbeat-логи, авто-реконнект WS.
-
-Всё поведение настраивается через ENV (пороги, окна, шаги, RPS и т.д.).
-
-P.S. У тебя в коде прописан TG bot token и chat_id — лучше вынести в ENV и не публиковать.
-
-Вы сказали:
-как выглядят мои логи ? 
-ChatGPT сказал:
-
-Думал на протяжении 23s
-Примерно так — каждая строка начинается с ISO-временем, дальше иконка/тег и сообщение.
-
-2025-09-16T12:00:00.123Z Zero-miss watcher starting… | THR= 1 | DELAYS= 5000/10000/15000/final@45000 | SLOT= 3x700ms | RPS= 3 | ELIG= ≥30 for 30s step 5s | INSTANT= on (minConsec=1, mode=stop) | TZ= Europe/Moscow
-2025-09-16T12:00:00.456Z ✅ WS connected: wss://pumpportal.fun/api/data
-2025-09-16T12:00:00.457Z 📡 Subscribed: subscribeNewToken
-
-2025-09-16T12:00:05.512Z … not live | 9Fh1...Mint | slot=first | viewers=n/a | is_currently_live=false
-2025-09-16T12:00:06.230Z ❌ fetch error: HTTP 429 | mint: 9Fh1...Mint (penalty 30000ms)
-2025-09-16T12:00:10.015Z ↪️  schedule FINAL | 9Fh1...Mint | reason=always goodFalse=1 unknown=1
-
-2025-09-16T12:00:05.789Z 🔥 LIVE | 4b2C...Mint | (no-name) | v=57 | reason=viewers/flag | +5.31s от WS → candidate
-2025-09-16T12:00:05.790Z 🎯 ELIG start 30s | 4b2C...Mint | thr=30 | step=5s | ticks=6
-2025-09-16T12:00:05.791Z ⏱️ stabilize 1/6 | state=live | viewers=57 | ok=1 | consec=1
-2025-09-16T12:00:05.792Z ⚡ INSTANT ELIGIBLE (≥30) | 4b2C...Mint | hit@+0.00s от LIVE (+5.31s от WS) | max=57 | samples=1/1
-2025-09-16T12:00:05.950Z 🖼️ TG photo: direct OK | https://cloudflare-ipfs.com/ipfs/...
-2025-09-16T12:00:05.951Z 🛑 INSTANT-STOP | <mint=4b2C...Mint> | уведомлено, окно закрыто на 1/6
-
-2025-09-16T12:00:30.000Z 🧹 final skip not_live | 9Fh1...Mint | goodFalse=1 unknown=1
-2025-09-16T12:00:30.123Z [stats] active=0 api:req=18 ok=16 html=0 empty=0 parse=0 http=1 429=1 throw=0 decide: live=1 not_live=3 unknown=2 ws: events=5 dups=1 bumps=1 jobs: new=2 done=2 final=1 elig: started=1 ok=1 fail=0 | lat(LIVE) p50=5.31s p95=5.31s | lat(≥30) p50=0.00s p95=0.00s
-
-2025-09-16T12:02:10.777Z 🖼️ img too big 14652349 | https://example.com/cover.png
-2025-09-16T12:02:10.980Z ⚠️ TG upload fail 400 Bad Request: IMAGE_PROCESS_FAILED
-2025-09-16T12:02:10.981Z ℹ️ TG photo fallback → text only
-
-2025-09-16T12:05:00.000Z WS closed → reconnect in 3s
-2025-09-16T12:05:03.005Z ✅ WS connected: wss://pumpportal.fun/api/data
-Что где:
-
-старты/реконнекты: “Zero-miss watcher starting…”, “WS connected/closed”.
-
-проверки монеты: “… not live”, “❌ fetch error”, “↪️ schedule FINAL”.
-
-лайв и окно ≥N: “🔥 LIVE…”, “🎯 ELIG start…”, “⏱️ stabilize i/N…”.
-
-успех/фейл окна: “⚡ INSTANT ELIGIBLE… / ✅ ELIGIBLE… / 🚫 NOT ELIGIBLE…”.
-
-Telegram: “🖼️ TG photo: direct OK / upload OK / fallback → text only”, плюс предупреждения “⚠️ TG … fail”.
-
-heartbeat каждые HEARTBEAT_MS: строка [stats] … с метриками и p50/p95 задержек.
-
-Если хочешь, сгенерирую маленький фейковый лог под твои текущие ENV (порог/окна/RPS), чтобы проверить формат.
-
-
-
-
-Файл не выбранФайл не выбран
-ChatGPT может допускать ошибки. Проверьте важную информацию. См. настройки cookie-файлов.
+process.on("SIGINT", ()=>process.exit(0));
