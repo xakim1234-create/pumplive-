@@ -35,7 +35,7 @@ const MIN_CONSEC_SAMPLES    = envI("MIN_CONSEC_SAMPLES", 1); // сразу, бе
 // Anti-spike (по умолчанию ВЫКЛЮЧЕН)
 const SPIKE_GUARD           = envI("SPIKE_GUARD", 0); // 1=включить анти-спайк
 const SPIKE_RATIO           = envN("SPIKE_RATIO", 2.0);
-const SPIKE_MIN_ABS         = envI("SPIKE_MIN_ABS", 6);
+const SPIKE_MIN_ABS         = envI("SPIKE_MIN_ABS", 600);
 
 // Rate limit
 const GLOBAL_RPS            = envN("GLOBAL_RPS", 3);
